@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - exercised by the dependency check
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 MODEL = "gpt-transcribe"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_HOTKEY = "ctrl+shift+space"

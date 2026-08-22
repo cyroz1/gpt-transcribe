@@ -9,7 +9,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.0"
+private let appVersion = "0.3.1"
 private let model = "gpt-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
 private let defaultHotkey = "ctrl+shift+space"
@@ -632,11 +632,37 @@ enum PasteError: LocalizedError {
 
 // MARK: - Settings window
 
+final class PasteableSecureTextField: NSSecureTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command, event.charactersIgnoringModifiers?.lowercased() == "v" {
+            pasteFromClipboard()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command, event.charactersIgnoringModifiers?.lowercased() == "v" {
+            pasteFromClipboard()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func pasteFromClipboard() {
+        guard let value = NSPasteboard.general.string(forType: .string), !value.isEmpty else { return }
+        stringValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        currentEditor()?.selectedRange = NSRange(location: stringValue.count, length: 0)
+    }
+}
+
 final class SettingsWindowController: NSWindowController {
     private let hotkeyField: NSTextField
     private let languageField: NSTextField
     private let maxSecondsField: NSTextField
-    private let apiKeyField: NSSecureTextField
+    private let apiKeyField: PasteableSecureTextField
     private let launchAtLoginButton: NSButton
     private let apiKeyStatusLabel: NSTextField
     private let saveHandler: (AppConfig, String) -> Void
@@ -646,7 +672,7 @@ final class SettingsWindowController: NSWindowController {
         self.hotkeyField = NSTextField(string: config.hotkey)
         self.languageField = NSTextField(string: config.language)
         self.maxSecondsField = NSTextField(string: String(config.maxRecordingSeconds))
-        self.apiKeyField = NSSecureTextField(string: "")
+        self.apiKeyField = PasteableSecureTextField(string: "")
         self.launchAtLoginButton = NSButton(checkboxWithTitle: "Launch GPT Transcribe at login", target: nil, action: nil)
         self.apiKeyStatusLabel = NSTextField(labelWithString: "")
         self.saveHandler = saveHandler
@@ -701,7 +727,7 @@ final class SettingsWindowController: NSWindowController {
             [NSTextField(labelWithString: "Language"), languageField],
             [NSTextField(labelWithString: "Max recording seconds"), maxSecondsField],
             [NSTextField(labelWithString: "Microphone"), NSTextField(labelWithString: "macOS default input")],
-            [NSTextField(labelWithString: "OpenAI API key"), apiKeyField],
+            [NSTextField(labelWithString: "OpenAI API key"), apiKeyInputRow()],
         ])
         grid.rowSpacing = 10
         grid.columnSpacing = 14
@@ -752,6 +778,23 @@ final class SettingsWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    private func apiKeyInputRow() -> NSView {
+        let pasteButton = NSButton(title: "Paste", target: self, action: #selector(pasteAPIKey))
+        pasteButton.bezelStyle = .rounded
+        let row = NSStackView(views: [apiKeyField, pasteButton])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        apiKeyField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pasteButton.setContentHuggingPriority(.required, for: .horizontal)
+        return row
+    }
+
+    @objc private func pasteAPIKey() {
+        apiKeyField.pasteFromClipboard()
+        apiKeyStatusLabel.stringValue = apiKeyField.stringValue.isEmpty ? "Clipboard does not contain text." : "Key pasted. Save to store it in Keychain."
     }
 
     @objc private func cancelClicked() {

@@ -15,7 +15,7 @@ The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on
 
 Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. To insert text into other apps, allow GPT Transcribe under **System Settings → Privacy & Security → Accessibility**.
 
-Open the menu-bar microphone icon and choose **Settings…**. The macOS app stores an API key in the macOS Keychain; it never writes the key to the settings file. It also accepts `OPENAI_API_KEY` from the process environment, which is useful for development.
+Open the menu-bar microphone icon and choose **Settings…**. The macOS app stores an API key in the macOS Keychain; it never writes the key to the settings file. It also accepts `OPENAI_API_KEY` from the process environment, which is useful for development. If `Command+V` is unavailable in the secure field, use the field's **Paste** button.
 
 ### Use
 
