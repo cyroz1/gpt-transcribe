@@ -1,37 +1,49 @@
-# GPT Transcribe for Windows
+# GPT Transcribe
 
-A lightweight Windows tray service that lets you dictate into almost any focused text box using OpenAI's GPT Transcribe model instead of Windows voice typing. The published Windows installer installs it system-wide under Program Files.
+GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. It uses OpenAI's `gpt-transcribe` model and keeps the recording in memory until the transcription request is sent.
 
-> This is a user-session tray application, not a Windows Service Control Manager service. It runs only while the signed-in user session is active.
+The repository contains two native desktop implementations:
 
-## What it does
+- macOS: a Swift/AppKit menu-bar app for macOS 13 and newer.
+- Windows: a Python tray app for Windows 10 and 11.
 
-- Registers a global hotkey (`Ctrl+Shift+Space` by default).
-- Records from the selected microphone while listening.
-- Holds the recording in memory as a WAV payload; it does not create a local audio file.
-- Sends the completed recording to `POST /v1/audio/transcriptions` with model `gpt-transcribe`.
-- Returns focus to the text box that was active when dictation started.
-- Inserts the transcript through the Windows clipboard and simulated `Ctrl+V`.
-- Restores the previous text clipboard contents when possible.
-- Shows status and errors from the system tray icon.
+The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on macOS. Both versions support an optional language hint, a 5–180 second recording limit, launch at login, and clipboard-based insertion.
 
-## Quick start
+## macOS
 
-### 1. Set the API key
+### Install
 
-Create a Windows **user** environment variable:
+Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. To insert text into other apps, allow GPT Transcribe under **System Settings → Privacy & Security → Accessibility**.
 
-| Name | Value |
-| --- | --- |
-| `OPENAI_API_KEY` | Your OpenAI Platform API key |
+Open the menu-bar microphone icon and choose **Settings…**. The macOS app stores an API key in the macOS Keychain; it never writes the key to the settings file. It also accepts `OPENAI_API_KEY` from the process environment, which is useful for development.
 
-Use **Edit the system environment variables** → **Environment Variables** → **User variables**. Do not put the key in source code, `config.json`, the repository, or a command committed to shell history.
+### Use
 
-After changing the variable, fully quit and relaunch GPT Transcribe so Windows gives the app the updated environment.
+1. Focus a text field in another app.
+2. Press `Control+Shift+Space` to start listening.
+3. Speak normally.
+4. Press the same hotkey to stop.
+5. The transcript is pasted into the original app.
 
-### 2. Install and launch
+The menu-bar app uses the macOS default input device. Change it in **System Settings → Sound → Input**. Settings and logs live under `~/Library/Application Support/GPT Transcribe/`; preferences are stored through `UserDefaults`.
 
-Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe-windows/releases) and run it as an administrator. The installer places GPT Transcribe under Program Files and adds a Start Menu shortcut. For a source build, run the executable produced by `build.ps1`.
+### Build from source
+
+Requirements: macOS 13 or newer, Xcode Command Line Tools, and network access to `api.openai.com`.
+
+```bash
+./macos/build-macos.sh
+```
+
+The script runs the Swift tests, builds a release binary, creates `dist/GPTTranscribe.app`, ad-hoc signs it for local use, and creates `dist/GPTTranscribe.dmg` when `hdiutil` is available. The app is intentionally not notarized by this repository; a distribution certificate and Apple notarization credentials belong in the release environment.
+
+## Windows
+
+### Install and use
+
+Create a Windows **user** environment variable named `OPENAI_API_KEY` containing an OpenAI Platform API key. Do not put the key in source code, `config.json`, the repository, or a shell command committed to history. Fully quit and relaunch the app after changing the variable.
+
+Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases) and run it as an administrator. The installer places GPT Transcribe under Program Files and adds a Start Menu shortcut. For a source build, run the executable produced by `build.ps1`.
 
 1. Click inside a text box in any application.
 2. Press `Ctrl+Shift+Space` to start listening.
@@ -41,39 +53,11 @@ Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://githu
 
 Right-click the microphone icon in the system tray for Settings, the log folder, or Quit. The app prevents multiple copies from running at the same time.
 
-## Settings
-
-The tray Settings window supports:
-
-- Hotkey: a modifier combination such as `ctrl+shift+space` or `alt+space`.
-- Language hint: optional ISO-639-1 code such as `en`.
-- Maximum recording length: 5–180 seconds.
-- Microphone: default input device or a specific input device.
-- Launch GPT Transcribe when I sign in: per-user startup setting, off by default.
-
-Settings are stored at `%APPDATA%\GPTTranscribe\config.json`. The API key is not stored there. Logs are written to `%APPDATA%\GPTTranscribe\app.log` and are intended to contain app status and error messages, not audio or credentials.
-
-## Build from source
-
-Requirements:
-
-- Windows 10 or Windows 11
-- Python 3.12 or newer
-- Network access to `api.openai.com`
-- Microphone permission in Windows Privacy & security settings
-- Inno Setup 6, only when compiling the installer locally
-
-From PowerShell in the project folder:
-
-```powershell
-.\build.ps1
-```
-
-The script creates an isolated build environment under `work\.venv`, installs the dependencies, and packages the app with PyInstaller. To compile the system-wide installer locally after installing Inno Setup 6, run `iscc .\installer\GPTTranscribe.iss` after the build completes.
-
-The installer is compiled automatically by GitHub Actions whenever a `v*` tag is pushed. It publishes only `GPTTranscribe-Setup.exe` as the release asset. Installing requires administrator approval because it targets Program Files; the launch-on-login setting itself is per-user.
+The Windows Settings window supports the hotkey, language hint, maximum recording length, microphone selection, and launch at sign-in. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
 
 ## Development checks
+
+Windows:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -81,56 +65,57 @@ python gpt_transcribe.py --check
 python gpt_transcribe.py --list-devices
 ```
 
-`--check` verifies the Windows runtime, environment variable presence, and installed Python dependencies. `--list-devices` prints the audio devices visible to PortAudio. Tests are intentionally offline and do not send audio to the API.
+macOS:
+
+```bash
+swift test --package-path macos
+./macos/build-macos.sh
+```
+
+The tests are offline and do not send audio to OpenAI. The `--check` command verifies the Windows runtime and Python dependencies; `--list-devices` prints PortAudio input devices.
 
 ## Privacy and security
 
 - Audio is held in memory only until the user stops listening, then sent to OpenAI for transcription.
-- No recording is written to disk by the app.
-- The API key is read from `OPENAI_API_KEY` at runtime and never persisted by the app.
-- The launch-on-login setting writes only the current user's Windows Run entry; it does not require or store the API key.
-- The repository must remain private if it contains the packaged executable or internal documentation.
-- Clipboard insertion is used for compatibility with ordinary text inputs. Clipboard data may be visible to other local applications while it is being used.
-- The app uses synthetic keyboard input. Elevated, secure, password, sandboxed, or otherwise protected text fields may reject paste input.
+- The app does not intentionally write recordings to disk.
+- macOS stores a configured API key in Keychain; Windows reads `OPENAI_API_KEY` at runtime.
+- Clipboard insertion temporarily exposes the transcript to local applications according to normal platform clipboard behavior.
+- Synthetic keyboard input may be rejected by elevated, secure, password, sandboxed, or otherwise protected text fields.
+- Launch-at-login is per-user on both platforms and does not grant elevation.
 
-See [`docs/architecture.md`](docs/architecture.md) for the component and data-flow design and [`SECURITY.md`](SECURITY.md) for reporting guidance.
+See [`docs/architecture.md`](docs/architecture.md) for the component and data-flow design and [`SECURITY.md`](SECURITY.md) for security boundaries and reporting guidance.
 
 ## Troubleshooting
 
-### The tray icon does not appear
-
-Run `python gpt_transcribe.py --check` from the project folder. If dependencies are missing, rerun `.\build.ps1`. Check `%APPDATA%\GPTTranscribe\app.log` for startup details.
-
 ### The hotkey does nothing
 
-Another application may already own the hotkey. Open Settings, choose another combination, save, then restart GPT Transcribe. Avoid hotkeys reserved by Windows or the application you use most.
+Another application may already own the hotkey. Open Settings, choose another combination, save, and try again. On macOS, global registration does not require Accessibility permission; Accessibility is needed for the final paste step.
 
 ### The microphone is unavailable
 
-Run `python gpt_transcribe.py --list-devices`, select an input device in Settings, and confirm microphone access is enabled in Windows Privacy & security → Microphone.
+On macOS, allow microphone access in **System Settings → Privacy & Security → Microphone** and choose an input under **System Settings → Sound → Input**. On Windows, run `python gpt_transcribe.py --list-devices` and confirm microphone access in **Privacy & security → Microphone**.
 
 ### The API rejects the request
 
-Confirm the Windows user variable is named exactly `OPENAI_API_KEY`, contains a valid OpenAI API key, and was set before launching the app. Restart the app after changing it. The app does not use a ChatGPT login or ChatGPT subscription as API authentication.
-
-### Launch on login does not work
-
-Open Settings and save **Launch GPT Transcribe when I sign in** again. The setting applies to the current Windows user and starts the installed Program Files executable at sign-in. If the app was uninstalled, reinstall it or turn the setting off before uninstalling.
+Confirm the key is a valid OpenAI Platform API key. The macOS app reads the Keychain value first after checking `OPENAI_API_KEY`; the Windows app reads the environment variable. The app does not use a ChatGPT login or ChatGPT subscription as API authentication.
 
 ### Text is not inserted
 
-Make sure the target window still exists and accepts `Ctrl+V`. Try a normal text editor first. Applications running as administrator may not accept input from a non-elevated tray app.
+Try a normal text editor first. On macOS, grant Accessibility access to GPT Transcribe and relaunch it. On Windows, make sure the target window accepts `Ctrl+V`; applications running as administrator may reject input from a non-elevated tray app.
 
 ## Project layout
 
 ```text
-gpt_transcribe.py            Main tray app and Windows integration
-tests/test_core.py           Offline tests for audio, multipart, and settings helpers
-build.ps1                    Reproducible PyInstaller build
-installer/GPTTranscribe.iss System-wide Inno Setup installer definition
-.github/workflows/           Automated tagged-release installer build
-docs/architecture.md         Detailed runtime and data-flow documentation
-SECURITY.md                  Security boundary and reporting notes
+gpt_transcribe.py                    Windows tray app and platform integration
+tests/test_core.py                   Offline Python tests
+build.ps1                            Windows PyInstaller build
+installer/GPTTranscribe.iss         Windows Inno Setup definition
+macos/Package.swift                  Native macOS Swift package
+macos/Sources/GPTTranscribeMac/      Native macOS menu-bar app
+macos/Tests/                         Native macOS unit tests
+macos/build-macos.sh                 macOS .app and DMG build
+.github/workflows/                   Tagged Windows and macOS release builds
+SECURITY.md                          Security boundaries and reporting guidance
 ```
 
 ## References

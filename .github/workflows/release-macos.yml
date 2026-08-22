@@ -1,0 +1,33 @@
+name: Build and release macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+
+      - name: Run native macOS tests
+        run: swift test --package-path macos
+
+      - name: Build app bundle and DMG
+        run: ./macos/build-macos.sh
+
+      - name: Publish macOS release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: GPT Transcribe ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/GPTTranscribe.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.3.0"
 #endif
 
 #define AppName "GPT Transcribe"
@@ -11,7 +11,7 @@ AppId={{B5E4A8D6-1E6B-4D3D-9B4F-7D2D7A9B1E42}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-AppPublisherURL=https://github.com/cyroz1/gpt-transcribe-windows
+AppPublisherURL=https://github.com/cyroz1/gpt-transcribe
 DefaultDirName={autopf}\GPT Transcribe
 DefaultGroupName=GPT Transcribe
 DisableProgramGroupPage=yes
