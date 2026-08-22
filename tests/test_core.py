@@ -1,12 +1,16 @@
 import io
+import json
+import os
 import sys
+import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from gpt_transcribe import build_multipart, make_wav, parse_hotkey  # noqa: E402
+from gpt_transcribe import Config, build_multipart, make_wav, parse_hotkey, startup_command  # noqa: E402
 
 
 class CoreTests(unittest.TestCase):
@@ -34,6 +38,23 @@ class CoreTests(unittest.TestCase):
         self.assertIn(b"dictation.wav", body)
         self.assertIn(b"abc", body)
         self.assertIn(boundary.encode(), body)
+
+    def test_launch_on_login_setting_normalizes_values(self):
+        self.assertFalse(Config().launch_on_login)
+        self.assertTrue(Config({"launch_on_login": True}).launch_on_login)
+        self.assertTrue(Config({"launch_on_login": "yes"}).launch_on_login)
+        self.assertFalse(Config({"launch_on_login": "false"}).launch_on_login)
+
+    def test_launch_on_login_setting_persists(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
+            Config({"launch_on_login": True}).save()
+            with open(Path(directory) / "GPTTranscribe" / "config.json", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        self.assertTrue(payload["launch_on_login"])
+
+    def test_startup_command_targets_current_app(self):
+        command = startup_command()
+        self.assertIn("gpt_transcribe.py", command)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,11 @@ import urllib.request
 import wave
 
 try:
+    import winreg
+except ImportError:  # pragma: no cover - Windows-only dependency
+    winreg = None
+
+try:
     import sounddevice as sd
 except ImportError:  # pragma: no cover - exercised by the dependency check
     sd = None
@@ -30,12 +35,14 @@ except ImportError:  # pragma: no cover - exercised by the dependency check
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 MODEL = "gpt-transcribe"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_HOTKEY = "ctrl+shift+space"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_MAX_RECORDING_SECONDS = 90
+STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "GPTTranscribe"
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
@@ -129,6 +136,31 @@ def config_path() -> Path:
     return app_data_dir() / "config.json"
 
 
+def startup_command() -> str:
+    executable = Path(sys.executable).resolve()
+    if getattr(sys, "frozen", False):
+        return f'"{executable}"'
+    return f'"{executable}" "{Path(__file__).resolve()}"'
+
+
+def set_launch_on_login(enabled: bool) -> None:
+    if winreg is None:
+        raise RuntimeError("Launch on login is available only on Windows.")
+    with winreg.CreateKeyEx(
+        winreg.HKEY_CURRENT_USER,
+        STARTUP_REGISTRY_PATH,
+        0,
+        winreg.KEY_SET_VALUE,
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def configure_logging() -> logging.Logger:
     directory = app_data_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -156,6 +188,7 @@ class TranscriptionError(RuntimeError):
 class Config:
     def __init__(self, values: dict[str, object] | None = None):
         values = values or {}
+        self.launch_on_login = self._as_bool(values.get("launch_on_login", False))
         self.hotkey = str(values.get("hotkey", DEFAULT_HOTKEY)).strip().lower() or DEFAULT_HOTKEY
         self.language = str(values.get("language", "")).strip()
         self.max_recording_seconds = self._bounded_int(
@@ -172,6 +205,14 @@ class Config:
         )
         device = values.get("audio_device")
         self.audio_device = device if isinstance(device, int) else None
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _bounded_int(value: object, minimum: int, maximum: int, fallback: int) -> int:
@@ -199,6 +240,7 @@ class Config:
         directory = config_path().parent
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
+            "launch_on_login": self.launch_on_login,
             "hotkey": self.hotkey,
             "language": self.language,
             "max_recording_seconds": self.max_recording_seconds,
@@ -780,14 +822,21 @@ class App:
                 row=4, column=1, sticky="ew", pady=4
             )
 
+            launch_on_login = tk.BooleanVar(value=self.config.launch_on_login)
+            ttk.Checkbutton(
+                frame,
+                text="Launch GPT Transcribe when I sign in",
+                variable=launch_on_login,
+            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+
             ttk.Label(
                 frame,
                 text="Audio is sent to OpenAI only after you stop listening.\nThe API key is read from OPENAI_API_KEY and never saved here.",
                 foreground="#555555",
-            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 12))
+            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 12))
 
             buttons = ttk.Frame(frame)
-            buttons.grid(row=6, column=0, columnspan=2, sticky="e")
+            buttons.grid(row=7, column=0, columnspan=2, sticky="e")
 
             def save_and_close() -> None:
                 try:
@@ -800,8 +849,15 @@ class App:
                 self.config.language = language.get().strip()
                 self.config.max_recording_seconds = seconds
                 self.config.audio_device = device_ids[device_labels.index(device.get())]
+                try:
+                    set_launch_on_login(bool(launch_on_login.get()))
+                except Exception as exc:
+                    log_exception("Could not update launch-on-login setting", exc)
+                    messagebox.showerror("Launch on login", str(exc), parent=root)
+                    return
+                self.config.launch_on_login = bool(launch_on_login.get())
                 self.config.save()
-                self._notify(APP_NAME, "Settings saved. Restart the app to apply a new hotkey.")
+                self._notify(APP_NAME, "Settings saved. Launch on login applies at your next sign-in.")
                 root.destroy()
 
             ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
@@ -851,6 +907,13 @@ def main() -> int:
         return list_devices()
     if "--check" in sys.argv:
         return check_installation()
+    if "--remove-launch-on-login" in sys.argv:
+        try:
+            set_launch_on_login(False)
+            return 0
+        except Exception as exc:
+            log_exception("Could not remove launch-on-login setting", exc)
+            return 1
     instance = SingleInstance()
     if not instance.acquire():
         show_error("GPT Transcribe is already running. Look for its microphone icon in the system tray.")

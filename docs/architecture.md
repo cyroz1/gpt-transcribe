@@ -64,7 +64,13 @@ The previous Unicode text clipboard value is retained in memory and restored one
 
 `pystray` owns the tray icon and menu. Pillow generates the icon at runtime, with a light state while recording. Settings are saved under `%APPDATA%\GPTTranscribe\config.json`; logs are written beside it in `app.log`.
 
+The Launch on login setting is stored in the config file and mirrored to the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value. It launches the installed executable at sign-in and is disabled by default.
+
 The app uses a named local mutex so a second launch exits instead of registering a duplicate hotkey or creating competing clipboard writes.
+
+### System-wide installer
+
+The tagged-release workflow builds the PyInstaller executable, then compiles `installer/GPTTranscribe.iss` with Inno Setup. The installer requires administrator approval and places the executable under `%ProgramFiles%\GPT Transcribe`, with Start Menu and optional common-desktop shortcuts. User configuration remains in each user's `%APPDATA%` directory.
 
 ## State machine
 
@@ -86,6 +92,7 @@ The transcription worker runs separately from the tray and hotkey threads so the
 | API key | Process memory only | Authorization header to OpenAI |
 | Transcript | Process memory, clipboard, target app | Target foreground window and clipboard |
 | Settings | Persistent local JSON | `%APPDATA%\GPTTranscribe\config.json` |
+| Launch-on-login command | Per-user Windows Run value | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
 | Logs | Persistent local text | `%APPDATA%\GPTTranscribe\app.log` |
 
 The application has no local server, database, cloud storage, or background upload queue. It requires the user's Windows session and microphone permission.

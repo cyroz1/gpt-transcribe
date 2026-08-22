@@ -1,6 +1,6 @@
 # GPT Transcribe for Windows
 
-A lightweight Windows tray service that lets you dictate into almost any focused text box using OpenAI's GPT Transcribe model instead of Windows voice typing.
+A lightweight Windows tray service that lets you dictate into almost any focused text box using OpenAI's GPT Transcribe model instead of Windows voice typing. The published Windows installer installs it system-wide under Program Files.
 
 > This is a user-session tray application, not a Windows Service Control Manager service. It runs only while the signed-in user session is active.
 
@@ -29,9 +29,9 @@ Use **Edit the system environment variables** → **Environment Variables** → 
 
 After changing the variable, fully quit and relaunch GPT Transcribe so Windows gives the app the updated environment.
 
-### 2. Launch
+### 2. Install and launch
 
-Run `outputs\GPTTranscribe.exe`.
+Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe-windows/releases) and run it as an administrator. The installer places GPT Transcribe under Program Files and adds a Start Menu shortcut. For a source build, run the executable produced by `build.ps1`.
 
 1. Click inside a text box in any application.
 2. Press `Ctrl+Shift+Space` to start listening.
@@ -49,6 +49,7 @@ The tray Settings window supports:
 - Language hint: optional ISO-639-1 code such as `en`.
 - Maximum recording length: 5–180 seconds.
 - Microphone: default input device or a specific input device.
+- Launch GPT Transcribe when I sign in: per-user startup setting, off by default.
 
 Settings are stored at `%APPDATA%\GPTTranscribe\config.json`. The API key is not stored there. Logs are written to `%APPDATA%\GPTTranscribe\app.log` and are intended to contain app status and error messages, not audio or credentials.
 
@@ -60,6 +61,7 @@ Requirements:
 - Python 3.12 or newer
 - Network access to `api.openai.com`
 - Microphone permission in Windows Privacy & security settings
+- Inno Setup 6, only when compiling the installer locally
 
 From PowerShell in the project folder:
 
@@ -67,19 +69,9 @@ From PowerShell in the project folder:
 .\build.ps1
 ```
 
-The script creates an isolated build environment under `work\.venv`, installs the dependencies, packages the app with PyInstaller, and writes the executable to `outputs\GPTTranscribe.exe`.
+The script creates an isolated build environment under `work\.venv`, installs the dependencies, and packages the app with PyInstaller. To compile the system-wide installer locally after installing Inno Setup 6, run `iscc .\installer\GPTTranscribe.iss` after the build completes.
 
-To install the packaged app at Windows sign-in:
-
-```powershell
-.\install_startup.ps1
-```
-
-To remove the startup shortcut:
-
-```powershell
-.\install_startup.ps1 -Remove
-```
+The installer is compiled automatically by GitHub Actions whenever a `v*` tag is pushed. It publishes only `GPTTranscribe-Setup.exe` as the release asset. Installing requires administrator approval because it targets Program Files; the launch-on-login setting itself is per-user.
 
 ## Development checks
 
@@ -96,6 +88,7 @@ python gpt_transcribe.py --list-devices
 - Audio is held in memory only until the user stops listening, then sent to OpenAI for transcription.
 - No recording is written to disk by the app.
 - The API key is read from `OPENAI_API_KEY` at runtime and never persisted by the app.
+- The launch-on-login setting writes only the current user's Windows Run entry; it does not require or store the API key.
 - The repository must remain private if it contains the packaged executable or internal documentation.
 - Clipboard insertion is used for compatibility with ordinary text inputs. Clipboard data may be visible to other local applications while it is being used.
 - The app uses synthetic keyboard input. Elevated, secure, password, sandboxed, or otherwise protected text fields may reject paste input.
@@ -120,6 +113,10 @@ Run `python gpt_transcribe.py --list-devices`, select an input device in Setting
 
 Confirm the Windows user variable is named exactly `OPENAI_API_KEY`, contains a valid OpenAI API key, and was set before launching the app. Restart the app after changing it. The app does not use a ChatGPT login or ChatGPT subscription as API authentication.
 
+### Launch on login does not work
+
+Open Settings and save **Launch GPT Transcribe when I sign in** again. The setting applies to the current Windows user and starts the installed Program Files executable at sign-in. If the app was uninstalled, reinstall it or turn the setting off before uninstalling.
+
 ### Text is not inserted
 
 Make sure the target window still exists and accepts `Ctrl+V`. Try a normal text editor first. Applications running as administrator may not accept input from a non-elevated tray app.
@@ -127,13 +124,13 @@ Make sure the target window still exists and accepts `Ctrl+V`. Try a normal text
 ## Project layout
 
 ```text
-gpt_transcribe.py       Main tray app and Windows integration
-tests/test_core.py      Offline tests for audio, multipart, and hotkey helpers
-build.ps1               Reproducible PyInstaller build
-install_startup.ps1     Optional per-user startup shortcut
-docs/architecture.md    Detailed runtime and data-flow documentation
-SECURITY.md             Security boundary and reporting notes
-outputs/                Packaged executable and source archive
+gpt_transcribe.py            Main tray app and Windows integration
+tests/test_core.py           Offline tests for audio, multipart, and settings helpers
+build.ps1                    Reproducible PyInstaller build
+installer/GPTTranscribe.iss System-wide Inno Setup installer definition
+.github/workflows/           Automated tagged-release installer build
+docs/architecture.md         Detailed runtime and data-flow documentation
+SECURITY.md                  Security boundary and reporting notes
 ```
 
 ## References
