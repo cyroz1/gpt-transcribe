@@ -9,11 +9,12 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.1"
+private let appVersion = "0.3.2"
 private let model = "gpt-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
 private let defaultHotkey = "ctrl+shift+space"
 private let defaultMaxRecordingSeconds = 90
+private let failedRecordingFilename = "failed-recording.wav"
 
 // MARK: - Local storage and logging
 
@@ -21,6 +22,25 @@ func appSupportDirectory() -> URL {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
     return base.appendingPathComponent(appName, isDirectory: true)
+}
+
+func failedRecordingURL(in directory: URL = appSupportDirectory()) -> URL {
+    directory.appendingPathComponent(failedRecordingFilename, isDirectory: false)
+}
+
+@discardableResult
+func saveFailedRecording(_ audio: Data, in directory: URL = appSupportDirectory()) throws -> URL {
+    let fileManager = FileManager.default
+    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = failedRecordingURL(in: directory)
+    try audio.write(to: url, options: [.atomic])
+    return url
+}
+
+func deleteFailedRecording(at url: URL = failedRecordingURL()) throws {
+    let fileManager = FileManager.default
+    guard fileManager.fileExists(atPath: url.path) else { return }
+    try fileManager.removeItem(at: url)
 }
 
 final class AppLogger {
@@ -864,11 +884,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menu: NSMenu!
     private var recordingTimer: Timer?
     private var targetApplication: NSRunningApplication?
+    private var pendingRecordingURL: URL?
     private var settingsWindowController: SettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         config = configStore.load()
+        let savedRecording = failedRecordingURL()
+        if FileManager.default.fileExists(atPath: savedRecording.path) {
+            pendingRecordingURL = savedRecording
+        }
         buildStatusItem()
         registerHotkey()
         requestNotificationPermission()
@@ -902,6 +927,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let recordItem = NSMenuItem(title: recordMenuTitle(), action: #selector(toggleRecording), keyEquivalent: "")
         recordItem.target = self
         menu.addItem(recordItem)
+        let retryItem = NSMenuItem(title: "Retry failed recording", action: #selector(retryFailedRecording), keyEquivalent: "")
+        retryItem.target = self
+        retryItem.isEnabled = canRetry
+        menu.addItem(retryItem)
+        let deleteItem = NSMenuItem(title: "Delete saved recording", action: #selector(deleteSavedRecording), keyEquivalent: "")
+        deleteItem.target = self
+        deleteItem.isEnabled = canRetry
+        menu.addItem(deleteItem)
         menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
@@ -957,10 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         state = .starting
-        targetApplication = NSWorkspace.shared.frontmostApplication
-        if targetApplication?.bundleIdentifier == Bundle.main.bundleIdentifier {
-            targetApplication = nil
-        }
+        targetApplication = currentTargetApplication()
         updateStatusItem()
         audioRecorder.start { [weak self] result in
             DispatchQueue.main.async {
@@ -999,8 +1029,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             finish(status: "No audio captured", notify: true)
             return
         }
+        transcribeAndPaste(audio: audio, target: target, pendingURL: nil)
+    }
+
+    private func transcribeAndPaste(audio: Data, target: NSRunningApplication?, pendingURL: URL?) {
+        guard audio.count >= 1_000 else {
+            finish(status: "No audio captured", notify: true)
+            return
+        }
         guard let apiKey = KeychainStore.configuredValue else {
-            finish(status: TranscriptionError.missingAPIKey.localizedDescription, notify: true)
+            let saved = saveForRetry(audio)
+            finish(status: failureStatus(TranscriptionError.missingAPIKey.localizedDescription, saved: saved), notify: true)
             return
         }
         let configSnapshot = config
@@ -1009,23 +1048,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 switch result {
                 case .success(let transcript) where transcript.isEmpty:
-                    self.finish(status: "No speech detected", notify: true)
+                    let saved = self.saveForRetry(audio)
+                    self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
                 case .success(let transcript):
-                    pasteText(transcript, into: target) { pasteResult in
-                        DispatchQueue.main.async {
+                    pasteText(transcript, into: target) { [weak self] pasteResult in
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
                             switch pasteResult {
                             case .success:
-                                self.finish(status: "Inserted transcript", notify: false)
+                                let removed: Bool
+                                if let pendingURL {
+                                    removed = self.removeSavedRecording(at: pendingURL)
+                                } else {
+                                    removed = true
+                                }
+                                self.finish(
+                                    status: removed ? "Inserted transcript" : "Inserted transcript; saved recording retained",
+                                    notify: !removed
+                                )
                             case .failure(let error):
-                                self.finish(status: error.localizedDescription, notify: true)
+                                let saved = self.saveForRetry(audio)
+                                self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                             }
                         }
                     }
                 case .failure(let error):
                     self.logger.error("Transcription failed: \(error.localizedDescription)")
-                    self.finish(status: error.localizedDescription, notify: true)
+                    let saved = self.saveForRetry(audio)
+                    self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                 }
             }
+        }
+    }
+
+    private func saveForRetry(_ audio: Data) -> Bool {
+        do {
+            pendingRecordingURL = try saveFailedRecording(audio)
+            return true
+        } catch {
+            logger.error("Could not save failed recording: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func removeSavedRecording(at url: URL) -> Bool {
+        do {
+            try deleteFailedRecording(at: url)
+            if pendingRecordingURL?.path == url.path {
+                pendingRecordingURL = nil
+            }
+            return true
+        } catch {
+            logger.error("Could not delete saved recording: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func failureStatus(_ reason: String, saved: Bool) -> String {
+        let message = reason.hasSuffix(".") ? reason : "\(reason)."
+        return message + (saved ? " Saved recording for retry." : " Could not save recording for retry.")
+    }
+
+    private var canRetry: Bool {
+        guard state == .idle, let url = pendingRecordingURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    private func currentTargetApplication() -> NSRunningApplication? {
+        let application = NSWorkspace.shared.frontmostApplication
+        return application?.bundleIdentifier == Bundle.main.bundleIdentifier ? nil : application
+    }
+
+    @objc private func retryFailedRecording() {
+        guard state == .idle, let url = pendingRecordingURL else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            pendingRecordingURL = nil
+            finish(status: "Saved recording is unavailable", notify: true)
+            return
+        }
+
+        let target = currentTargetApplication()
+        state = .transcribing
+        status = "Retrying saved recording…"
+        updateStatusItem()
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                let audio = try Data(contentsOf: url)
+                DispatchQueue.main.async {
+                    self?.transcribeAndPaste(audio: audio, target: target, pendingURL: url)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.logger.error("Could not read saved recording: \(error.localizedDescription)")
+                    self.finish(status: "Could not read saved recording", notify: true)
+                }
+            }
+        }
+    }
+
+    @objc private func deleteSavedRecording() {
+        guard state == .idle, let url = pendingRecordingURL else { return }
+        if removeSavedRecording(at: url) {
+            finish(status: "Saved recording deleted", notify: true)
+        } else {
+            finish(status: "Could not delete saved recording", notify: true)
         }
     }
 

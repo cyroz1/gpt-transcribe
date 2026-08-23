@@ -2,45 +2,39 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-import io
+from importlib import util as importlib_util
 import json
 import logging
 import os
 from pathlib import Path
-import secrets
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
-import wave
 
 try:
     import winreg
 except ImportError:  # pragma: no cover - Windows-only dependency
     winreg = None
 
-try:
-    import sounddevice as sd
-except ImportError:  # pragma: no cover - exercised by the dependency check
-    sd = None
-
-try:
-    import pystray
-    from PIL import Image, ImageDraw
-except ImportError:  # pragma: no cover - exercised by the dependency check
-    pystray = None
-    Image = None
-    ImageDraw = None
+# These optional modules are loaded only when their functionality is needed.
+# In particular, sounddevice imports CFFI and PortAudio, neither of which is
+# needed while the tray app is idle.
+sd = None
+pystray = None
+Image = None
+ImageDraw = None
+_SOUNDDEVICE_IMPORT_ERROR: ImportError | None = None
+_TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 MODEL = "gpt-transcribe"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_HOTKEY = "ctrl+shift+space"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_MAX_RECORDING_SECONDS = 90
+FAILED_RECORDING_FILENAME = "failed-recording.wav"
 STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "GPTTranscribe"
 
@@ -126,6 +120,47 @@ class MSG(ctypes.Structure):
     ]
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib_util.find_spec(module_name) is not None
+    except (ImportError, AttributeError):
+        return False
+
+
+def _load_sounddevice():
+    global sd, _SOUNDDEVICE_IMPORT_ERROR
+    if sd is not None:
+        return sd
+    if _SOUNDDEVICE_IMPORT_ERROR is not None:
+        raise RuntimeError("sounddevice is not installed. Run the setup/build script first.") from _SOUNDDEVICE_IMPORT_ERROR
+    try:
+        import sounddevice as sounddevice_module
+    except (ImportError, OSError) as exc:  # pragma: no cover - dependency-specific
+        _SOUNDDEVICE_IMPORT_ERROR = exc
+        raise RuntimeError("sounddevice is not installed. Run the setup/build script first.") from exc
+    sd = sounddevice_module
+    return sd
+
+
+def _load_tray_dependencies():
+    global pystray, Image, ImageDraw, _TRAY_IMPORT_ERROR
+    if pystray is not None and Image is not None and ImageDraw is not None:
+        return pystray
+    if _TRAY_IMPORT_ERROR is not None:
+        raise RuntimeError("pystray and Pillow are required to create the tray app.") from _TRAY_IMPORT_ERROR
+    try:
+        import pystray as pystray_module
+        from PIL import Image as image_module
+        from PIL import ImageDraw as image_draw_module
+    except (ImportError, OSError) as exc:  # pragma: no cover - dependency-specific
+        _TRAY_IMPORT_ERROR = exc
+        raise RuntimeError("pystray and Pillow are required to create the tray app.") from exc
+    pystray = pystray_module
+    Image = image_module
+    ImageDraw = image_draw_module
+    return pystray
+
+
 def app_data_dir() -> Path:
     roaming = os.environ.get("APPDATA")
     base = Path(roaming) if roaming else Path.home() / "AppData" / "Roaming"
@@ -134,6 +169,35 @@ def app_data_dir() -> Path:
 
 def config_path() -> Path:
     return app_data_dir() / "config.json"
+
+
+def failed_recording_path() -> Path:
+    return app_data_dir() / FAILED_RECORDING_FILENAME
+
+
+def save_failed_recording(audio_bytes: bytes) -> Path:
+    path = failed_recording_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(audio_bytes)
+        temporary.replace(path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+def delete_failed_recording(path: Path | None = None) -> None:
+    target = path or failed_recording_path()
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def startup_command() -> str:
@@ -161,20 +225,30 @@ def set_launch_on_login(enabled: bool) -> None:
                 pass
 
 
+LOGGER = logging.getLogger("gpt_transcribe")
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+LOGGER.addHandler(logging.NullHandler())
+
+
 def configure_logging() -> logging.Logger:
+    if any(getattr(handler, "_gpt_transcribe_file_handler", False) for handler in LOGGER.handlers):
+        return LOGGER
+    from logging.handlers import RotatingFileHandler
+
     directory = app_data_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("gpt_transcribe")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    handler = logging.FileHandler(directory / "app.log", encoding="utf-8")
+    handler = RotatingFileHandler(
+        directory / "app.log",
+        maxBytes=512 * 1024,
+        backupCount=1,
+        encoding="utf-8",
+        delay=True,
+    )
+    handler._gpt_transcribe_file_handler = True
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-    return logger
-
-
-LOGGER = configure_logging()
+    LOGGER.addHandler(handler)
+    return LOGGER
 
 
 def log_exception(message: str, exc: BaseException) -> None:
@@ -302,7 +376,10 @@ def parse_hotkey(value: str) -> tuple[int, int]:
     return modifiers | MOD_NOREPEAT, virtual_key
 
 
-def make_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
+def make_wav(pcm_bytes: bytes | bytearray | memoryview, sample_rate: int) -> bytes:
+    import io
+    import wave
+
     output = io.BytesIO()
     with wave.open(output, "wb") as audio:
         audio.setnchannels(1)
@@ -313,6 +390,8 @@ def make_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
 
 
 def build_multipart(fields: dict[str, str], filename: str, file_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+    import secrets
+
     boundary = "----GPTTranscribe" + secrets.token_hex(16)
     chunks: list[bytes] = []
     for name, value in fields.items():
@@ -360,6 +439,9 @@ def _api_error_message(response_bytes: bytes, status: int) -> str:
 
 
 def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
+    import urllib.error as urllib_error
+    import urllib.request as urllib_request
+
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise TranscriptionError("OPENAI_API_KEY is not available to this app.")
@@ -367,7 +449,10 @@ def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
     if config.language:
         fields["language"] = config.language
     body, boundary = build_multipart(fields, "dictation.wav", audio_bytes, "audio/wav")
-    request = urllib.request.Request(
+    # The multipart body owns its own copy of the WAV payload. Release the
+    # larger temporary as soon as the body has been assembled.
+    del audio_bytes
+    request = urllib_request.Request(
         TRANSCRIPTION_URL,
         data=body,
         method="POST",
@@ -378,15 +463,19 @@ def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        raise TranscriptionError(_api_error_message(raw, exc.code)) from None
-    except urllib.error.URLError as exc:
-        raise TranscriptionError(f"Could not reach OpenAI: {exc.reason}") from None
-    except TimeoutError:
-        raise TranscriptionError("The transcription request timed out.") from None
+        try:
+            with urllib_request.urlopen(request, timeout=180) as response:
+                raw = response.read()
+        except urllib_error.HTTPError as exc:
+            raw = exc.read()
+            raise TranscriptionError(_api_error_message(raw, exc.code)) from None
+        except urllib_error.URLError as exc:
+            raise TranscriptionError(f"Could not reach OpenAI: {exc.reason}") from None
+        except TimeoutError:
+            raise TranscriptionError("The transcription request timed out.") from None
+    finally:
+        # Do not retain the request body while parsing the small JSON response.
+        del request, body
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -476,10 +565,14 @@ def paste_text(text: str, target_window: int | None) -> None:
     USER32.keybd_event(VK_V, 0, 0, 0)
     USER32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
     USER32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-    threading.Timer(1.0, _restore_clipboard_if_unchanged, args=(previous, text)).start()
+    restore_timer = threading.Timer(1.0, _restore_clipboard_if_unchanged, args=(previous, text))
+    restore_timer.daemon = True
+    restore_timer.start()
 
 
 def create_icon_image(recording: bool = False) -> "Image.Image":
+    if Image is None or ImageDraw is None:
+        _load_tray_dependencies()
     if Image is None or ImageDraw is None:
         raise RuntimeError("Pillow is required to create the tray icon.")
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -522,29 +615,37 @@ class App:
         self.icon = None
         self.stream = None
         self.recording_timer: threading.Timer | None = None
-        self.audio_chunks: list[bytes] = []
+        self.audio_buffer = bytearray()
+        self.audio_status_logged = False
         self.audio_sample_rate = self.config.sample_rate
         self.target_window: int | None = None
+        saved_recording = failed_recording_path()
+        self.pending_audio_path: Path | None = saved_recording if saved_recording.is_file() else None
+        self.pending_target_window: int | None = None
 
     def run(self) -> None:
-        if sd is None or pystray is None or Image is None:
-            missing = []
-            if sd is None:
-                missing.append("sounddevice")
-            if pystray is None:
-                missing.append("pystray")
-            if Image is None:
-                missing.append("Pillow")
-            raise RuntimeError("Missing Python dependencies: " + ", ".join(missing))
-        self.icon = pystray.Icon(
+        tray = _load_tray_dependencies()
+        if not _module_available("sounddevice"):
+            raise RuntimeError("Missing Python dependency: sounddevice")
+        self.icon = tray.Icon(
             APP_NAME,
             create_icon_image(),
             APP_NAME,
-            menu=pystray.Menu(
-                pystray.MenuItem(self._menu_record_label, self._menu_toggle),
-                pystray.MenuItem("Settings…", self._menu_settings),
-                pystray.MenuItem("Open log folder", self._menu_open_log_folder),
-                pystray.MenuItem("Quit", self._menu_quit),
+            menu=tray.Menu(
+                tray.MenuItem(self._menu_record_label, self._menu_toggle),
+                tray.MenuItem(
+                    self._menu_retry_label,
+                    self._menu_retry,
+                    enabled=self._can_retry,
+                ),
+                tray.MenuItem(
+                    "Delete saved recording",
+                    self._menu_delete_saved_recording,
+                    enabled=self._can_retry,
+                ),
+                tray.MenuItem("Settings…", self._menu_settings),
+                tray.MenuItem("Open log folder", self._menu_open_log_folder),
+                tray.MenuItem("Quit", self._menu_quit),
             ),
         )
         self.hotkey_thread = threading.Thread(target=self._hotkey_loop, name="GPTTranscribeHotkey", daemon=True)
@@ -605,12 +706,20 @@ class App:
             if self.state != "idle":
                 return
             self.state = "starting"
-            self.audio_chunks = []
+            self.audio_buffer = bytearray()
+            self.audio_status_logged = False
             self.target_window = int(USER32.GetForegroundWindow() or 0) or None
             self.audio_sample_rate = self.config.sample_rate
+        try:
+            sounddevice = _load_sounddevice()
+        except RuntimeError as exc:
+            with self.state_lock:
+                self.state = "idle"
+            self._set_status(str(exc), notify=True)
+            return
         stream = None
         try:
-            stream = sd.RawInputStream(
+            stream = sounddevice.RawInputStream(
                 samplerate=self.config.sample_rate,
                 blocksize=0,
                 device=self.config.audio_device,
@@ -622,7 +731,7 @@ class App:
         except Exception as first_error:
             log_exception("Configured microphone could not start", first_error)
             try:
-                stream = sd.RawInputStream(
+                stream = sounddevice.RawInputStream(
                     samplerate=None,
                     blocksize=0,
                     device=self.config.audio_device,
@@ -659,11 +768,15 @@ class App:
         self.recording_timer.start()
 
     def _audio_callback(self, indata, _frames, _time_info, status) -> None:
-        if status:
-            LOGGER.warning("Audio status: %s", status)
+        log_status = False
         with self.state_lock:
             if self.state == "recording":
-                self.audio_chunks.append(bytes(indata))
+                self.audio_buffer.extend(indata)
+                if status and not self.audio_status_logged:
+                    self.audio_status_logged = True
+                    log_status = True
+        if log_status:
+            LOGGER.warning("Audio status: %s", status)
 
     def stop_recording(self) -> None:
         with self.state_lock:
@@ -672,8 +785,8 @@ class App:
             self.state = "transcribing"
             stream = self.stream
             self.stream = None
-            chunks = self.audio_chunks
-            self.audio_chunks = []
+            pcm_buffer = self.audio_buffer
+            self.audio_buffer = bytearray()
             sample_rate = self.audio_sample_rate
             target_window = self.target_window
             if self.recording_timer:
@@ -689,7 +802,8 @@ class App:
                 stream.close()
         except Exception as exc:
             log_exception("Could not close microphone stream", exc)
-        audio_bytes = make_wav(b"".join(chunks), sample_rate)
+        audio_bytes = make_wav(pcm_buffer, sample_rate)
+        del pcm_buffer
         if len(audio_bytes) < 1_000:
             self._finish_with_status("No audio captured", notify=True)
             return
@@ -702,20 +816,76 @@ class App:
         worker.start()
         self._beep(660)
 
-    def _transcribe_and_paste(self, audio_bytes: bytes, target_window: int | None) -> None:
+    def _save_for_retry(self, audio_bytes: bytes, target_window: int | None) -> bool:
+        try:
+            path = save_failed_recording(audio_bytes)
+        except Exception as exc:
+            log_exception("Could not save failed recording", exc)
+            return False
+        with self.state_lock:
+            self.pending_audio_path = path
+            self.pending_target_window = target_window
+            if self.icon:
+                self.icon.update_menu()
+        return True
+
+    def _remove_saved_recording(self, path: Path) -> bool:
+        try:
+            delete_failed_recording(path)
+        except Exception as exc:
+            log_exception("Could not delete saved recording", exc)
+            return False
+        with self.state_lock:
+            if self.pending_audio_path == path:
+                self.pending_audio_path = None
+                self.pending_target_window = None
+        return True
+
+    @staticmethod
+    def _failure_status(reason: str, saved: bool) -> str:
+        message = reason.rstrip(".") + "."
+        if saved:
+            return message + " Saved recording for retry."
+        return message + " Could not save recording for retry."
+
+    def _transcribe_and_paste(
+        self,
+        audio_bytes: bytes,
+        target_window: int | None,
+        pending_path: Path | None = None,
+    ) -> None:
         try:
             transcript = transcribe_audio(audio_bytes, self.config)
             if not transcript:
-                self._finish_with_status("No speech detected", notify=True)
+                saved = self._save_for_retry(audio_bytes, target_window)
+                self._finish_with_status(self._failure_status("No speech detected", saved), notify=True)
                 return
             paste_text(transcript, target_window)
-            self._finish_with_status("Inserted transcript", notify=False)
+            removed = pending_path is None or self._remove_saved_recording(pending_path)
+            self._finish_with_status(
+                "Inserted transcript" if removed else "Inserted transcript; saved recording retained",
+                notify=not removed,
+            )
         except TranscriptionError as exc:
             log_exception("Transcription failed", exc)
-            self._finish_with_status(str(exc), notify=True)
+            saved = self._save_for_retry(audio_bytes, target_window)
+            self._finish_with_status(self._failure_status(str(exc), saved), notify=True)
         except Exception as exc:
             log_exception("Could not insert transcript", exc)
-            self._finish_with_status("Could not insert transcript", notify=True)
+            saved = self._save_for_retry(audio_bytes, target_window)
+            self._finish_with_status(self._failure_status("Could not insert transcript", saved), notify=True)
+
+    def _retry_failed_recording(self, path: Path, target_window: int | None) -> None:
+        try:
+            audio_bytes = path.read_bytes()
+        except Exception as exc:
+            log_exception("Could not read saved recording", exc)
+            self._finish_with_status("Could not read saved recording", notify=True)
+            return
+        if len(audio_bytes) < 1_000:
+            self._finish_with_status("Saved recording is empty", notify=True)
+            return
+        self._transcribe_and_paste(audio_bytes, target_window, pending_path=path)
 
     def _finish_with_status(self, status: str, notify: bool) -> None:
         with self.state_lock:
@@ -761,8 +931,60 @@ class App:
                 return "Transcribing…"
             return f"Start listening ({self.config.hotkey})"
 
+    def _menu_retry_label(self, _item) -> str:
+        return "Retry failed recording"
+
+    def _can_retry(self, _item) -> bool:
+        with self.state_lock:
+            return (
+                self.state == "idle"
+                and self.pending_audio_path is not None
+                and self.pending_audio_path.is_file()
+            )
+
     def _menu_toggle(self, _icon, _item) -> None:
         self.toggle_recording()
+
+    def _menu_retry(self, _icon, _item) -> None:
+        missing = False
+        with self.state_lock:
+            if self.state != "idle":
+                return
+            path = self.pending_audio_path
+            if path is None or not path.is_file():
+                missing = path is not None
+                path = None
+                self.pending_audio_path = None
+                self.pending_target_window = None
+            else:
+                target_window = self.pending_target_window
+                if target_window is None or not USER32.IsWindow(target_window):
+                    target_window = int(USER32.GetForegroundWindow() or 0) or None
+                self.state = "transcribing"
+                self.status = "Retrying saved recording…"
+                if self.icon:
+                    self.icon.update_menu()
+                    self.icon.title = f"{APP_NAME} — Retrying saved recording"
+        if missing:
+            self._set_status("Saved recording is unavailable", notify=True)
+            return
+        if path is None:
+            return
+        worker = threading.Thread(
+            target=self._retry_failed_recording,
+            args=(path, target_window),
+            name="GPTTranscribeRetry",
+            daemon=True,
+        )
+        worker.start()
+
+    def _menu_delete_saved_recording(self, _icon, _item) -> None:
+        with self.state_lock:
+            if self.state != "idle" or self.pending_audio_path is None:
+                return
+            path = self.pending_audio_path
+        if self._remove_saved_recording(path):
+            self._set_status("Saved recording deleted", notify=True)
 
     def _menu_quit(self, icon, _item) -> None:
         icon.stop()
@@ -807,9 +1029,13 @@ class App:
 
             device_ids: list[int | None] = [None]
             device_labels = ["Default microphone"]
-            if sd is not None:
+            try:
+                sounddevice = _load_sounddevice()
+            except RuntimeError:
+                sounddevice = None
+            if sounddevice is not None:
                 try:
-                    for index, device_info in enumerate(sd.query_devices()):
+                    for index, device_info in enumerate(sounddevice.query_devices()):
                         if int(device_info.get("max_input_channels", 0)) > 0:
                             device_ids.append(index)
                             device_labels.append(f"{index}: {device_info.get('name', 'Microphone')}")
@@ -868,11 +1094,13 @@ class App:
 
 
 def list_devices() -> int:
-    if sd is None:
-        print("sounddevice is not installed. Run the setup/build script first.")
+    try:
+        sounddevice = _load_sounddevice()
+    except RuntimeError as exc:
+        print(exc)
         return 1
     try:
-        print(sd.query_devices())
+        print(sounddevice.query_devices())
         return 0
     except Exception as exc:
         print(f"Could not enumerate audio devices: {exc}")
@@ -883,9 +1111,9 @@ def check_installation() -> int:
     checks = {
         "Windows": sys.platform == "win32",
         "OPENAI_API_KEY present": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
-        "sounddevice installed": sd is not None,
-        "pystray installed": pystray is not None,
-        "Pillow installed": Image is not None,
+        "sounddevice installed": _module_available("sounddevice"),
+        "pystray installed": _module_available("pystray"),
+        "Pillow installed": _module_available("PIL"),
     }
     for name, passed in checks.items():
         print(f"{'OK' if passed else 'MISSING'}  {name}")
@@ -908,12 +1136,14 @@ def main() -> int:
     if "--check" in sys.argv:
         return check_installation()
     if "--remove-launch-on-login" in sys.argv:
+        configure_logging()
         try:
             set_launch_on_login(False)
             return 0
         except Exception as exc:
             log_exception("Could not remove launch-on-login setting", exc)
             return 1
+    configure_logging()
     instance = SingleInstance()
     if not instance.acquire():
         show_error("GPT Transcribe is already running. Look for its microphone icon in the system tray.")

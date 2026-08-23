@@ -56,6 +56,8 @@ response_format=json
 
 An optional `language` hint is included when configured. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
 
+If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
+
 ### Target capture and paste
 
 At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. After transcription, each implementation restores the target, writes the transcript to its native clipboard, and sends a synthetic paste shortcut. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after Accessibility permission is granted.
@@ -91,6 +93,7 @@ The transcription worker runs separately from the tray/menu-bar and audio thread
 | Data | Lifetime | Destination |
 | --- | --- | --- |
 | Microphone PCM | In memory during recording and request preparation | OpenAI transcription endpoint after stop |
+| Failed recording | Until successful retry or user deletion | Windows: `%APPDATA%\GPTTranscribe\failed-recording.wav`; macOS: `~/Library/Application Support/GPT Transcribe/failed-recording.wav` |
 | API key | Process memory; macOS may persist it in Keychain | Authorization header to OpenAI |
 | Transcript | Process memory, clipboard, target app | Target foreground application and clipboard |
 | Settings | Persistent native preferences | Windows JSON; macOS `UserDefaults` |

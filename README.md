@@ -1,6 +1,6 @@
 # GPT Transcribe
 
-GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. It uses OpenAI's `gpt-transcribe` model and keeps the recording in memory until the transcription request is sent.
+GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. It uses OpenAI's `gpt-transcribe` model and keeps the recording in memory until the transcription request is sent; failed requests retain the latest WAV for retry.
 
 The repository contains two native desktop implementations:
 
@@ -24,6 +24,8 @@ Open the menu-bar microphone icon and choose **Settings…**. The macOS app stor
 3. Speak normally.
 4. Press the same hotkey to stop.
 5. The transcript is pasted into the original app.
+
+Open the menu-bar microphone menu to retry or delete a saved failed recording.
 
 The menu-bar app uses the macOS default input device. Change it in **System Settings → Sound → Input**. Settings and logs live under `~/Library/Application Support/GPT Transcribe/`; preferences are stored through `UserDefaults`.
 
@@ -51,7 +53,7 @@ Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://githu
 4. Press `Ctrl+Shift+Space` again to stop.
 5. The transcript is pasted into the original text box.
 
-Right-click the microphone icon in the system tray for Settings, the log folder, or Quit. The app prevents multiple copies from running at the same time.
+Right-click the microphone icon in the system tray for Settings, retrying or deleting a saved failed recording, the log folder, or Quit. The app prevents multiple copies from running at the same time.
 
 The Windows Settings window supports the hotkey, language hint, maximum recording length, microphone selection, and launch at sign-in. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
 
@@ -76,8 +78,9 @@ The tests are offline and do not send audio to OpenAI. The `--check` command ver
 
 ## Privacy and security
 
-- Audio is held in memory only until the user stops listening, then sent to OpenAI for transcription.
-- The app does not intentionally write recordings to disk.
+- Audio is held in memory until the user stops listening, then sent to OpenAI for transcription.
+- If transcription or insertion fails, the latest WAV is retained for retry at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. It is deleted after a successful retry or through **Delete saved recording** in the tray/menu-bar menu.
+- Apart from that failure-recovery file, the app does not intentionally write recordings to disk.
 - macOS stores a configured API key in Keychain; Windows reads `OPENAI_API_KEY` at runtime.
 - Clipboard insertion temporarily exposes the transcript to local applications according to normal platform clipboard behavior.
 - Synthetic keyboard input may be rejected by elevated, secure, password, sandboxed, or otherwise protected text fields.
