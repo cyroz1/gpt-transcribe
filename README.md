@@ -1,6 +1,6 @@
 # GPT Transcribe
 
-GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. It uses OpenAI's `gpt-transcribe` model and keeps the recording in memory until the transcription request is sent.
+GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. It uses OpenAI's `gpt-transcribe` model and keeps the recording in memory until the transcription request is sent; failed requests retain the latest WAV for retry.
 
 The repository contains two native desktop implementations:
 
@@ -13,7 +13,7 @@ The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on
 
 ### Install
 
-Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. To insert text into other apps, allow GPT Transcribe under **System Settings → Privacy & Security → Accessibility**.
+Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. Before recording, the app checks for Accessibility access and opens **System Settings → Privacy & Security → Accessibility** when it is missing.
 
 Open the menu-bar microphone icon and choose **Settings…**. The macOS app stores an API key in the macOS Keychain; it never writes the key to the settings file. It also accepts `OPENAI_API_KEY` from the process environment, which is useful for development. If `Command+V` is unavailable in the secure field, use the field's **Paste** button.
 
@@ -25,6 +25,8 @@ Open the menu-bar microphone icon and choose **Settings…**. The macOS app stor
 4. Press the same hotkey to stop.
 5. The transcript is pasted into the original app.
 
+Open the menu-bar microphone menu to retry or delete a saved failed recording.
+
 The menu-bar app uses the macOS default input device. Change it in **System Settings → Sound → Input**. Settings and logs live under `~/Library/Application Support/GPT Transcribe/`; preferences are stored through `UserDefaults`.
 
 ### Build from source
@@ -35,7 +37,7 @@ Requirements: macOS 13 or newer, Xcode Command Line Tools, and network access to
 ./macos/build-macos.sh
 ```
 
-The script runs the Swift tests, builds a release binary, creates `dist/GPTTranscribe.app`, ad-hoc signs it for local use, and creates `dist/GPTTranscribe.dmg` when `hdiutil` is available. The app is intentionally not notarized by this repository; a distribution certificate and Apple notarization credentials belong in the release environment.
+The script runs the Swift tests, builds a release binary, creates `dist/GPTTranscribe.app`, signs it with `CODESIGN_IDENTITY` or the first local Apple Development identity when available, and creates `dist/GPTTranscribe.dmg` when `hdiutil` is available. It falls back to ad-hoc signing when no identity is available. The app is intentionally not notarized by this repository; a distribution certificate and Apple notarization credentials belong in the release environment.
 
 ## Windows
 
@@ -51,7 +53,7 @@ Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://githu
 4. Press `Ctrl+Shift+Space` again to stop.
 5. The transcript is pasted into the original text box.
 
-Right-click the microphone icon in the system tray for Settings, the log folder, or Quit. The app prevents multiple copies from running at the same time.
+Right-click the microphone icon in the system tray for Settings, retrying or deleting a saved failed recording, the log folder, or Quit. The app prevents multiple copies from running at the same time.
 
 The Windows Settings window supports the hotkey, language hint, maximum recording length, microphone selection, and launch at sign-in. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
 
@@ -76,8 +78,9 @@ The tests are offline and do not send audio to OpenAI. The `--check` command ver
 
 ## Privacy and security
 
-- Audio is held in memory only until the user stops listening, then sent to OpenAI for transcription.
-- The app does not intentionally write recordings to disk.
+- Audio is held in memory until the user stops listening, then sent to OpenAI for transcription.
+- If transcription or insertion fails, the latest WAV is retained for retry at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. It is deleted after a successful retry or through **Delete saved recording** in the tray/menu-bar menu.
+- Apart from that failure-recovery file, the app does not intentionally write recordings to disk.
 - macOS stores a configured API key in Keychain; Windows reads `OPENAI_API_KEY` at runtime.
 - Clipboard insertion temporarily exposes the transcript to local applications according to normal platform clipboard behavior.
 - Synthetic keyboard input may be rejected by elevated, secure, password, sandboxed, or otherwise protected text fields.
@@ -101,7 +104,7 @@ Confirm the key is a valid OpenAI Platform API key. The macOS app reads the Keyc
 
 ### Text is not inserted
 
-Try a normal text editor first. On macOS, grant Accessibility access to GPT Transcribe and relaunch it. On Windows, make sure the target window accepts `Ctrl+V`; applications running as administrator may reject input from a non-elevated tray app.
+Try a normal text editor first. On macOS, grant Accessibility access to GPT Transcribe when prompted. If the app was rebuilt or moved, remove the old GPT Transcribe entry and add the current app again, then retry. On Windows, make sure the target window accepts `Ctrl+V`; applications running as administrator may reject input from a non-elevated tray app.
 
 ## Project layout
 

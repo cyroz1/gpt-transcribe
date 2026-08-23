@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.3.1"
+  #define AppVersion "0.3.5"
 #endif
 
 #define AppName "GPT Transcribe"

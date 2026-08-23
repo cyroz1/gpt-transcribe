@@ -35,4 +35,19 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertTrue(multipart.body.contains(Data("abc".utf8)))
         XCTAssertTrue(multipart.body.contains(Data(multipart.boundary.utf8)))
     }
+
+    func testFailedRecordingIsSavedAsTheLatestWAV() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GPTTranscribeTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let path = try saveFailedRecording(Data("first".utf8), in: directory)
+        XCTAssertEqual(path, failedRecordingURL(in: directory))
+        XCTAssertEqual(try Data(contentsOf: path), Data("first".utf8))
+
+        _ = try saveFailedRecording(Data("latest".utf8), in: directory)
+        XCTAssertEqual(try Data(contentsOf: path), Data("latest".utf8))
+
+        try deleteFailedRecording(at: path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
+    }
 }
