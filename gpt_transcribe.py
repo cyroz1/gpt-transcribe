@@ -28,12 +28,14 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 MODEL = "gpt-transcribe"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_HOTKEY = "ctrl+shift+space"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_MAX_RECORDING_SECONDS = 90
+MIN_MAX_RECORDING_SECONDS = 5
+MAX_MAX_RECORDING_SECONDS = 180
 FAILED_RECORDING_FILENAME = "failed-recording.wav"
 STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "GPTTranscribe"
@@ -265,11 +267,8 @@ class Config:
         self.launch_on_login = self._as_bool(values.get("launch_on_login", False))
         self.hotkey = str(values.get("hotkey", DEFAULT_HOTKEY)).strip().lower() or DEFAULT_HOTKEY
         self.language = str(values.get("language", "")).strip()
-        self.max_recording_seconds = self._bounded_int(
-            values.get("max_recording_seconds", DEFAULT_MAX_RECORDING_SECONDS),
-            minimum=5,
-            maximum=180,
-            fallback=DEFAULT_MAX_RECORDING_SECONDS,
+        self.max_recording_seconds = self._normalize_max_recording_seconds(
+            values.get("max_recording_seconds", DEFAULT_MAX_RECORDING_SECONDS)
         )
         self.sample_rate = self._bounded_int(
             values.get("sample_rate", DEFAULT_SAMPLE_RATE),
@@ -295,6 +294,18 @@ class Config:
         except (TypeError, ValueError):
             return fallback
         return max(minimum, min(maximum, number))
+
+    @staticmethod
+    def _normalize_max_recording_seconds(value: object) -> int:
+        if isinstance(value, str) and not value.strip():
+            return 0
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_RECORDING_SECONDS
+        if number == 0:
+            return 0
+        return max(MIN_MAX_RECORDING_SECONDS, min(MAX_MAX_RECORDING_SECONDS, number))
 
     @classmethod
     def load(cls) -> "Config":
@@ -763,6 +774,12 @@ class App:
             self.icon.icon = create_icon_image(recording=True)
             self.icon.title = f"{APP_NAME} — Listening"
         self._beep(880)
+        self._start_recording_timer()
+
+    def _start_recording_timer(self) -> None:
+        if self.config.max_recording_seconds <= 0:
+            self.recording_timer = None
+            return
         self.recording_timer = threading.Timer(self.config.max_recording_seconds, self.stop_recording)
         self.recording_timer.daemon = True
         self.recording_timer.start()
@@ -1021,9 +1038,9 @@ class App:
             language = tk.StringVar(value=self.config.language)
             ttk.Entry(frame, textvariable=language, width=24).grid(row=2, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Max seconds").grid(row=3, column=0, sticky="w", pady=4)
-            max_seconds = tk.IntVar(value=self.config.max_recording_seconds)
-            ttk.Spinbox(frame, from_=5, to=180, textvariable=max_seconds, width=22).grid(
+            ttk.Label(frame, text="Max seconds (0 = unlimited)").grid(row=3, column=0, sticky="w", pady=4)
+            max_seconds = tk.StringVar(value=str(self.config.max_recording_seconds) if self.config.max_recording_seconds else "")
+            ttk.Spinbox(frame, from_=0, to=180, textvariable=max_seconds, width=22).grid(
                 row=3, column=1, sticky="ew", pady=4
             )
 
@@ -1067,9 +1084,21 @@ class App:
             def save_and_close() -> None:
                 try:
                     parse_hotkey(hotkey.get())
-                    seconds = max(5, min(180, int(max_seconds.get())))
                 except ValueError as exc:
                     messagebox.showerror("Invalid settings", str(exc), parent=root)
+                    return
+                raw_seconds = max_seconds.get().strip()
+                try:
+                    seconds = 0 if not raw_seconds else max(
+                        MIN_MAX_RECORDING_SECONDS,
+                        min(MAX_MAX_RECORDING_SECONDS, int(raw_seconds)),
+                    )
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid settings",
+                        f"Max seconds must be blank, 0, or a whole number from {MIN_MAX_RECORDING_SECONDS} to {MAX_MAX_RECORDING_SECONDS}.",
+                        parent=root,
+                    )
                     return
                 self.config.hotkey = hotkey.get().strip().lower()
                 self.config.language = language.get().strip()

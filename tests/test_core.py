@@ -37,6 +37,20 @@ class CoreTests(unittest.TestCase):
         payload = make_wav(bytearray(b"\x00\x00" * 16), 16_000)
         self.assertTrue(payload.startswith(b"RIFF"))
 
+    def test_recording_limit_accepts_unlimited_values(self):
+        self.assertEqual(Config({"max_recording_seconds": 0}).max_recording_seconds, 0)
+        self.assertEqual(Config({"max_recording_seconds": ""}).max_recording_seconds, 0)
+        self.assertEqual(Config({"max_recording_seconds": 4}).max_recording_seconds, 5)
+        self.assertEqual(Config({"max_recording_seconds": 999}).max_recording_seconds, 180)
+
+    def test_unlimited_recording_does_not_start_a_timer(self):
+        app = App()
+        app.config.max_recording_seconds = 0
+        with patch.object(core.threading, "Timer") as timer:
+            app._start_recording_timer()
+        timer.assert_not_called()
+        self.assertIsNone(app.recording_timer)
+
     def test_failed_recording_is_saved_as_the_latest_wav(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
             path = core.save_failed_recording(b"first")

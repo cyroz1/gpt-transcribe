@@ -7,7 +7,7 @@ The repository contains two native desktop implementations:
 - macOS: a Swift/AppKit menu-bar app for macOS 13 and newer.
 - Windows: a Python tray app for Windows 10 and 11.
 
-The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on macOS. Both versions support an optional language hint, a 5–180 second recording limit, launch at login, and clipboard-based insertion.
+The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on macOS. Both versions support an optional language hint, an optional 5–180 second recording limit, launch at login, and clipboard-based insertion. Leave the limit blank or enter `0` to record until you press the hotkey again.
 
 ## macOS
 
@@ -55,7 +55,7 @@ Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://githu
 
 Right-click the microphone icon in the system tray for Settings, retrying or deleting a saved failed recording, the log folder, or Quit. The app prevents multiple copies from running at the same time.
 
-The Windows Settings window supports the hotkey, language hint, maximum recording length, microphone selection, and launch at sign-in. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
+The Windows Settings window supports the hotkey, language hint, maximum recording length, microphone selection, and launch at sign-in. For unlimited recording, leave **Max seconds** blank or enter `0`. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
 
 ## Development checks
 

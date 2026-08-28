@@ -40,7 +40,7 @@ The default is `ctrl+shift+space` / `Control+Shift+Space`. The hotkey toggles be
 
 ### Audio capture
 
-The Windows recorder uses `sounddevice.RawInputStream` with one `int16` channel. It first tries the configured sample rate and falls back to the device's native rate if necessary. The macOS recorder uses `AVAudioEngine` and converts tap buffers to mono 16-bit PCM in memory. macOS follows the system default input device; Windows can select a PortAudio input device. A timer limits recordings to the configured 5–180 second range.
+The Windows recorder uses `sounddevice.RawInputStream` with one `int16` channel. It first tries the configured sample rate and falls back to the device's native rate if necessary. The macOS recorder uses `AVAudioEngine` and converts tap buffers to mono 16-bit PCM in memory. macOS follows the system default input device; Windows can select a PortAudio input device. A timer limits recordings to the configured positive 5–180 second range; a limit of `0` means no automatic stop timer.
 
 When recording stops, both implementations wrap the PCM bytes in a standard mono 16-bit WAV container. The WAV bytes are not written to a temporary file.
 

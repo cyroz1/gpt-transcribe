@@ -9,7 +9,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.5"
+private let appVersion = "0.3.6"
 private let model = "gpt-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
 private let defaultHotkey = "ctrl+shift+space"
@@ -110,7 +110,7 @@ struct AppConfig {
         hotkey = hotkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if hotkey.isEmpty { hotkey = defaultHotkey }
         language = language.trimmingCharacters(in: .whitespacesAndNewlines)
-        maxRecordingSeconds = min(180, max(5, maxRecordingSeconds))
+        maxRecordingSeconds = maxRecordingSeconds == 0 ? 0 : min(180, max(5, maxRecordingSeconds))
     }
 
     func save(to defaults: UserDefaults = .standard) {
@@ -119,6 +119,11 @@ struct AppConfig {
         defaults.set(maxRecordingSeconds, forKey: "maxRecordingSeconds")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
     }
+}
+
+func parseMaxRecordingSeconds(_ value: String) -> Int {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? 0 : (Int(trimmed) ?? defaultMaxRecordingSeconds)
 }
 
 enum KeychainStore {
@@ -714,7 +719,7 @@ final class SettingsWindowController: NSWindowController {
     init(config: AppConfig, keychainKeyExists: Bool, saveHandler: @escaping (AppConfig, String) -> Void, removeKeyHandler: @escaping () -> Void) {
         self.hotkeyField = NSTextField(string: config.hotkey)
         self.languageField = NSTextField(string: config.language)
-        self.maxSecondsField = NSTextField(string: String(config.maxRecordingSeconds))
+        self.maxSecondsField = NSTextField(string: config.maxRecordingSeconds == 0 ? "" : String(config.maxRecordingSeconds))
         self.apiKeyField = PasteableSecureTextField(string: "")
         self.launchAtLoginButton = NSButton(checkboxWithTitle: "Launch GPT Transcribe at login", target: nil, action: nil)
         self.apiKeyStatusLabel = NSTextField(labelWithString: "")
@@ -735,7 +740,7 @@ final class SettingsWindowController: NSWindowController {
         hotkeyField.placeholderString = "ctrl+shift+space"
         languageField.placeholderString = "Optional, e.g. en"
         maxSecondsField.alignment = .right
-        maxSecondsField.placeholderString = "5–180"
+        maxSecondsField.placeholderString = "0 = unlimited, or 5–180"
         apiKeyField.placeholderString = "Stored securely in the macOS Keychain"
         launchAtLoginButton.state = config.launchAtLogin ? .on : .off
         apiKeyStatusLabel.textColor = .secondaryLabelColor
@@ -858,7 +863,7 @@ final class SettingsWindowController: NSWindowController {
         var config = AppConfig(
             hotkey: hotkeyField.stringValue,
             language: languageField.stringValue,
-            maxRecordingSeconds: Int(maxSecondsField.stringValue) ?? defaultMaxRecordingSeconds,
+            maxRecordingSeconds: parseMaxRecordingSeconds(maxSecondsField.stringValue),
             launchAtLogin: launchAtLoginButton.state == .on
         )
         do {
@@ -1042,8 +1047,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.status = "Listening… press the hotkey to finish"
                     self.updateStatusItem()
                     self.recordingTimer?.invalidate()
-                    self.recordingTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(self.config.maxRecordingSeconds), repeats: false) { [weak self] _ in
-                        self?.stopRecording()
+                    self.recordingTimer = nil
+                    if self.config.maxRecordingSeconds > 0 {
+                        self.recordingTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(self.config.maxRecordingSeconds), repeats: false) { [weak self] _ in
+                            self?.stopRecording()
+                        }
                     }
                 case .failure(let error):
                     self.state = .idle

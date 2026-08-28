@@ -26,6 +26,10 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertEqual(config.hotkey, "ctrl+shift+space")
         XCTAssertEqual(config.language, "en")
         XCTAssertEqual(config.maxRecordingSeconds, 180)
+
+        XCTAssertEqual(AppConfig(maxRecordingSeconds: 0).maxRecordingSeconds, 0)
+        XCTAssertEqual(parseMaxRecordingSeconds(""), 0)
+        XCTAssertEqual(parseMaxRecordingSeconds("  "), 0)
     }
 
     func testMultipartContainsModelAndAudio() {
