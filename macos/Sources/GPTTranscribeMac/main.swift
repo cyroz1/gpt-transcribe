@@ -9,8 +9,8 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.6"
-private let model = "gpt-transcribe"
+private let appVersion = "0.3.7"
+private let model = "gpt-realtime-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
 private let defaultHotkey = "ctrl+shift+space"
 private let defaultMaxRecordingSeconds = 90
@@ -83,15 +83,35 @@ final class AppLogger {
     }
 }
 
+func parseSettingList(_ value: String) -> [String] {
+    value
+        .replacingOccurrences(of: ",", with: "\n")
+        .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+}
+
 struct AppConfig {
     var hotkey: String = defaultHotkey
-    var language: String = ""
+    var prompt: String = ""
+    var keywords: [String] = []
+    var languages: [String] = []
     var maxRecordingSeconds: Int = defaultMaxRecordingSeconds
     var launchAtLogin: Bool = false
 
-    init(hotkey: String = defaultHotkey, language: String = "", maxRecordingSeconds: Int = defaultMaxRecordingSeconds, launchAtLogin: Bool = false) {
+    init(
+        hotkey: String = defaultHotkey,
+        language: String = "",
+        prompt: String = "",
+        keywords: [String] = [],
+        languages: [String] = [],
+        maxRecordingSeconds: Int = defaultMaxRecordingSeconds,
+        launchAtLogin: Bool = false
+    ) {
         self.hotkey = hotkey
-        self.language = language
+        self.prompt = prompt
+        self.keywords = keywords
+        self.languages = languages.isEmpty ? parseSettingList(language) : languages
         self.maxRecordingSeconds = maxRecordingSeconds
         self.launchAtLogin = launchAtLogin
         normalize()
@@ -99,22 +119,40 @@ struct AppConfig {
 
     init(defaults: UserDefaults = .standard) {
         self.hotkey = defaults.string(forKey: "hotkey") ?? defaultHotkey
-        self.language = defaults.string(forKey: "language") ?? ""
+        self.prompt = defaults.string(forKey: "prompt") ?? ""
+        self.keywords = defaults.stringArray(forKey: "keywords") ?? []
+        if let storedLanguages = defaults.stringArray(forKey: "languages") {
+            self.languages = storedLanguages
+        } else {
+            self.languages = parseSettingList(defaults.string(forKey: "language") ?? "")
+        }
         let storedSeconds = defaults.object(forKey: "maxRecordingSeconds") as? NSNumber
         self.maxRecordingSeconds = storedSeconds?.intValue ?? defaultMaxRecordingSeconds
         self.launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? false
         normalize()
     }
 
+    var language: String {
+        get { languages.first ?? "" }
+        set { languages = parseSettingList(newValue) }
+    }
+
     mutating func normalize() {
         hotkey = hotkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if hotkey.isEmpty { hotkey = defaultHotkey }
-        language = language.trimmingCharacters(in: .whitespacesAndNewlines)
+        prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        keywords = parseSettingList(keywords.joined(separator: "\n"))
+        languages = parseSettingList(languages.joined(separator: "\n"))
         maxRecordingSeconds = maxRecordingSeconds == 0 ? 0 : min(180, max(5, maxRecordingSeconds))
     }
 
     func save(to defaults: UserDefaults = .standard) {
         defaults.set(hotkey, forKey: "hotkey")
+        defaults.set(prompt, forKey: "prompt")
+        defaults.set(keywords, forKey: "keywords")
+        defaults.set(languages, forKey: "languages")
+        // Keep the legacy key populated so older builds can still read the
+        // first configured language if the user downgrades.
         defaults.set(language, forKey: "language")
         defaults.set(maxRecordingSeconds, forKey: "maxRecordingSeconds")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
@@ -515,15 +553,34 @@ enum TranscriptionError: LocalizedError {
     }
 }
 
-func buildMultipart(fields: [String: String], filename: String, file: Data, mimeType: String) -> (body: Data, boundary: String) {
+func buildMultipart(
+    fields: [String: String],
+    filename: String,
+    file: Data,
+    mimeType: String
+) -> (body: Data, boundary: String) {
+    buildMultipart(fields: fields, repeatedFields: [:], filename: filename, file: file, mimeType: mimeType)
+}
+
+func buildMultipart(
+    fields: [String: String],
+    repeatedFields: [String: [String]],
+    filename: String,
+    file: Data,
+    mimeType: String
+) -> (body: Data, boundary: String) {
     let boundary = "----GPTTranscribe" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     var body = Data()
 
-    for (name, value) in fields {
+    func appendField(name: String, value: String) {
         body.append(contentsOf: "--\(boundary)\r\n".utf8)
         body.append(contentsOf: "Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".utf8)
         body.append(contentsOf: value.utf8)
         body.append(contentsOf: "\r\n".utf8)
+    }
+    for (name, value) in fields { appendField(name: name, value: value) }
+    for (name, values) in repeatedFields {
+        for value in values { appendField(name: name, value: value) }
     }
     body.append(contentsOf: "--\(boundary)\r\n".utf8)
     body.append(contentsOf: "Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n".utf8)
@@ -557,8 +614,17 @@ func apiErrorMessage(data: Data, status: Int) -> String {
 final class TranscriptionClient {
     func transcribe(audio: Data, config: AppConfig, apiKey: String, completion: @escaping (Result<String, Error>) -> Void) {
         var fields = ["model": model, "response_format": "json"]
-        if !config.language.isEmpty { fields["language"] = config.language }
-        let multipart = buildMultipart(fields: fields, filename: "dictation.wav", file: audio, mimeType: "audio/wav")
+        if !config.prompt.isEmpty { fields["prompt"] = config.prompt }
+        let multipart = buildMultipart(
+            fields: fields,
+            repeatedFields: [
+                "keywords[]": config.keywords,
+                "languages[]": config.languages,
+            ],
+            filename: "dictation.wav",
+            file: audio,
+            mimeType: "audio/wav"
+        )
 
         var request = URLRequest(url: transcriptionURL)
         request.httpMethod = "POST"
@@ -708,7 +774,9 @@ final class PasteableSecureTextField: NSSecureTextField {
 
 final class SettingsWindowController: NSWindowController {
     private let hotkeyField: NSTextField
-    private let languageField: NSTextField
+    private let languagesField: NSTextField
+    private let promptField: NSTextField
+    private let keywordsField: NSTextField
     private let maxSecondsField: NSTextField
     private let apiKeyField: PasteableSecureTextField
     private let launchAtLoginButton: NSButton
@@ -718,7 +786,9 @@ final class SettingsWindowController: NSWindowController {
 
     init(config: AppConfig, keychainKeyExists: Bool, saveHandler: @escaping (AppConfig, String) -> Void, removeKeyHandler: @escaping () -> Void) {
         self.hotkeyField = NSTextField(string: config.hotkey)
-        self.languageField = NSTextField(string: config.language)
+        self.languagesField = NSTextField(string: config.languages.joined(separator: ", "))
+        self.promptField = NSTextField(string: config.prompt)
+        self.keywordsField = NSTextField(string: config.keywords.joined(separator: ", "))
         self.maxSecondsField = NSTextField(string: config.maxRecordingSeconds == 0 ? "" : String(config.maxRecordingSeconds))
         self.apiKeyField = PasteableSecureTextField(string: "")
         self.launchAtLoginButton = NSButton(checkboxWithTitle: "Launch GPT Transcribe at login", target: nil, action: nil)
@@ -727,7 +797,7 @@ final class SettingsWindowController: NSWindowController {
         self.removeKeyHandler = removeKeyHandler
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -738,7 +808,9 @@ final class SettingsWindowController: NSWindowController {
         super.init(window: window)
 
         hotkeyField.placeholderString = "ctrl+shift+space"
-        languageField.placeholderString = "Optional, e.g. en"
+        languagesField.placeholderString = "Optional, e.g. en, fr"
+        promptField.placeholderString = "Optional context about the recording"
+        keywordsField.placeholderString = "Optional, comma-separated terms"
         maxSecondsField.alignment = .right
         maxSecondsField.placeholderString = "0 = unlimited, or 5–180"
         apiKeyField.placeholderString = "Stored securely in the macOS Keychain"
@@ -772,7 +844,9 @@ final class SettingsWindowController: NSWindowController {
 
         let grid = NSGridView(views: [
             [NSTextField(labelWithString: "Hotkey"), hotkeyField],
-            [NSTextField(labelWithString: "Language"), languageField],
+            [NSTextField(labelWithString: "Languages"), languagesField],
+            [NSTextField(labelWithString: "Prompt"), promptField],
+            [NSTextField(labelWithString: "Keywords"), keywordsField],
             [NSTextField(labelWithString: "Max recording seconds"), maxSecondsField],
             [NSTextField(labelWithString: "Microphone"), NSTextField(labelWithString: "macOS default input")],
             [NSTextField(labelWithString: "OpenAI API key"), apiKeyInputRow()],
@@ -795,7 +869,7 @@ final class SettingsWindowController: NSWindowController {
 
         stack.addArrangedSubview(launchAtLoginButton)
 
-        let note = NSTextField(labelWithString: "Audio stays in memory until you stop listening, then is sent to OpenAI. The API key is never written to the settings file.")
+        let note = NSTextField(labelWithString: "Audio stays in memory until you stop listening, then is sent to OpenAI. Prompt, keywords, and language hints are optional. The API key is never written to the settings file.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
         note.maximumNumberOfLines = 2
@@ -862,7 +936,9 @@ final class SettingsWindowController: NSWindowController {
     @objc private func saveClicked() {
         var config = AppConfig(
             hotkey: hotkeyField.stringValue,
-            language: languageField.stringValue,
+            prompt: promptField.stringValue,
+            keywords: parseSettingList(keywordsField.stringValue),
+            languages: parseSettingList(languagesField.stringValue),
             maxRecordingSeconds: parseMaxRecordingSeconds(maxSecondsField.stringValue),
             launchAtLogin: launchAtLoginButton.state == .on
         )

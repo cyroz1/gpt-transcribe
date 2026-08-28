@@ -28,8 +28,8 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.6"
-MODEL = "gpt-transcribe"
+APP_VERSION = "0.3.7"
+MODEL = "gpt-realtime-transcribe"
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 DEFAULT_HOTKEY = "ctrl+shift+space"
 DEFAULT_SAMPLE_RATE = 16_000
@@ -261,12 +261,26 @@ class TranscriptionError(RuntimeError):
     pass
 
 
+def parse_setting_list(value: object) -> list[str]:
+    """Normalize comma- or newline-separated transcription settings."""
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = str(value or "").replace(",", "\n").splitlines()
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
 class Config:
     def __init__(self, values: dict[str, object] | None = None):
         values = values or {}
         self.launch_on_login = self._as_bool(values.get("launch_on_login", False))
         self.hotkey = str(values.get("hotkey", DEFAULT_HOTKEY)).strip().lower() or DEFAULT_HOTKEY
-        self.language = str(values.get("language", "")).strip()
+        self.prompt = str(values.get("prompt") or "").strip()
+        self.keywords = parse_setting_list(values.get("keywords", []))
+        languages = values.get("languages")
+        if languages is None:
+            languages = values.get("language", "")
+        self.languages = parse_setting_list(languages)
         self.max_recording_seconds = self._normalize_max_recording_seconds(
             values.get("max_recording_seconds", DEFAULT_MAX_RECORDING_SECONDS)
         )
@@ -278,6 +292,15 @@ class Config:
         )
         device = values.get("audio_device")
         self.audio_device = device if isinstance(device, int) else None
+
+    @property
+    def language(self) -> str:
+        """Keep the old singular accessor available to callers."""
+        return self.languages[0] if self.languages else ""
+
+    @language.setter
+    def language(self, value: object) -> None:
+        self.languages = parse_setting_list(value)
 
     @staticmethod
     def _as_bool(value: object) -> bool:
@@ -327,7 +350,9 @@ class Config:
         payload = {
             "launch_on_login": self.launch_on_login,
             "hotkey": self.hotkey,
-            "language": self.language,
+            "prompt": self.prompt,
+            "keywords": self.keywords,
+            "languages": self.languages,
             "max_recording_seconds": self.max_recording_seconds,
             "sample_rate": self.sample_rate,
             "audio_device": self.audio_device,
@@ -400,20 +425,24 @@ def make_wav(pcm_bytes: bytes | bytearray | memoryview, sample_rate: int) -> byt
     return output.getvalue()
 
 
-def build_multipart(fields: dict[str, str], filename: str, file_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+def build_multipart(
+    fields: dict[str, str | list[str]], filename: str, file_bytes: bytes, mime_type: str
+) -> tuple[bytes, str]:
     import secrets
 
     boundary = "----GPTTranscribe" + secrets.token_hex(16)
     chunks: list[bytes] = []
     for name, value in fields.items():
-        chunks.extend(
-            [
-                f"--{boundary}\r\n".encode("utf-8"),
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
-                str(value).encode("utf-8"),
-                b"\r\n",
-            ]
-        )
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode("utf-8"),
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                    str(item).encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
     chunks.extend(
         [
             f"--{boundary}\r\n".encode("utf-8"),
@@ -456,9 +485,13 @@ def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise TranscriptionError("OPENAI_API_KEY is not available to this app.")
-    fields = {"model": MODEL, "response_format": "json"}
-    if config.language:
-        fields["language"] = config.language
+    fields: dict[str, str | list[str]] = {"model": MODEL, "response_format": "json"}
+    if config.prompt:
+        fields["prompt"] = config.prompt
+    if config.keywords:
+        fields["keywords[]"] = config.keywords
+    if config.languages:
+        fields["languages[]"] = config.languages
     body, boundary = build_multipart(fields, "dictation.wav", audio_bytes, "audio/wav")
     # The multipart body owns its own copy of the WAV payload. Release the
     # larger temporary as soon as the body has been assembled.
@@ -1026,6 +1059,7 @@ class App:
             root.attributes("-topmost", True)
             frame = ttk.Frame(root, padding=18)
             frame.grid()
+            frame.columnconfigure(1, weight=1)
 
             ttk.Label(frame, text="GPT Transcribe", font=("Segoe UI", 15, "bold")).grid(
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
@@ -1034,14 +1068,24 @@ class App:
             hotkey = tk.StringVar(value=self.config.hotkey)
             ttk.Entry(frame, textvariable=hotkey, width=24).grid(row=1, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Language (optional)").grid(row=2, column=0, sticky="w", pady=4)
-            language = tk.StringVar(value=self.config.language)
-            ttk.Entry(frame, textvariable=language, width=24).grid(row=2, column=1, sticky="ew", pady=4)
+            ttk.Label(frame, text="Languages (optional)").grid(row=2, column=0, sticky="w", pady=4)
+            languages = tk.StringVar(value=", ".join(self.config.languages))
+            ttk.Entry(frame, textvariable=languages, width=24).grid(row=2, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Max seconds (0 = unlimited)").grid(row=3, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text="Prompt (optional)").grid(row=3, column=0, sticky="nw", pady=4)
+            prompt = tk.Text(frame, width=32, height=3, wrap="word")
+            prompt.insert("1.0", self.config.prompt)
+            prompt.grid(row=3, column=1, sticky="ew", pady=4)
+
+            ttk.Label(frame, text="Keywords (optional)").grid(row=4, column=0, sticky="nw", pady=4)
+            keywords = tk.Text(frame, width=32, height=3, wrap="word")
+            keywords.insert("1.0", "\n".join(self.config.keywords))
+            keywords.grid(row=4, column=1, sticky="ew", pady=4)
+
+            ttk.Label(frame, text="Max seconds (0 = unlimited)").grid(row=5, column=0, sticky="w", pady=4)
             max_seconds = tk.StringVar(value=str(self.config.max_recording_seconds) if self.config.max_recording_seconds else "")
             ttk.Spinbox(frame, from_=0, to=180, textvariable=max_seconds, width=22).grid(
-                row=3, column=1, sticky="ew", pady=4
+                row=5, column=1, sticky="ew", pady=4
             )
 
             device_ids: list[int | None] = [None]
@@ -1058,11 +1102,11 @@ class App:
                             device_labels.append(f"{index}: {device_info.get('name', 'Microphone')}")
                 except Exception as exc:
                     log_exception("Could not enumerate microphones", exc)
-            ttk.Label(frame, text="Microphone").grid(row=4, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text="Microphone").grid(row=6, column=0, sticky="w", pady=4)
             selected_index = device_ids.index(self.config.audio_device) if self.config.audio_device in device_ids else 0
             device = tk.StringVar(value=device_labels[selected_index])
             ttk.Combobox(frame, textvariable=device, values=device_labels, state="readonly", width=21).grid(
-                row=4, column=1, sticky="ew", pady=4
+                row=6, column=1, sticky="ew", pady=4
             )
 
             launch_on_login = tk.BooleanVar(value=self.config.launch_on_login)
@@ -1070,16 +1114,16 @@ class App:
                 frame,
                 text="Launch GPT Transcribe when I sign in",
                 variable=launch_on_login,
-            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=4)
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
 
             ttk.Label(
                 frame,
-                text="Audio is sent to OpenAI only after you stop listening.\nThe API key is read from OPENAI_API_KEY and never saved here.",
+                text="Audio is sent to OpenAI after you stop listening. Prompt, keywords, and language hints are optional.\nThe API key is read from OPENAI_API_KEY and never saved here.",
                 foreground="#555555",
-            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 12))
+            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 12))
 
             buttons = ttk.Frame(frame)
-            buttons.grid(row=7, column=0, columnspan=2, sticky="e")
+            buttons.grid(row=9, column=0, columnspan=2, sticky="e")
 
             def save_and_close() -> None:
                 try:
@@ -1101,7 +1145,9 @@ class App:
                     )
                     return
                 self.config.hotkey = hotkey.get().strip().lower()
-                self.config.language = language.get().strip()
+                self.config.languages = parse_setting_list(languages.get())
+                self.config.prompt = prompt.get("1.0", "end-1c").strip()
+                self.config.keywords = parse_setting_list(keywords.get("1.0", "end-1c"))
                 self.config.max_recording_seconds = seconds
                 self.config.audio_device = device_ids[device_labels.index(device.get())]
                 try:

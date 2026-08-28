@@ -24,7 +24,7 @@ final class GPTTranscribeMacTests: XCTestCase {
     func testConfigNormalizesRecordingLimit() {
         let config = AppConfig(hotkey: "", language: " en ", maxRecordingSeconds: 999)
         XCTAssertEqual(config.hotkey, "ctrl+shift+space")
-        XCTAssertEqual(config.language, "en")
+        XCTAssertEqual(config.languages, ["en"])
         XCTAssertEqual(config.maxRecordingSeconds, 180)
 
         XCTAssertEqual(AppConfig(maxRecordingSeconds: 0).maxRecordingSeconds, 0)
@@ -32,12 +32,38 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertEqual(parseMaxRecordingSeconds("  "), 0)
     }
 
+    func testTranscriptionSettingsNormalize() {
+        let config = AppConfig(
+            prompt: " A support call ",
+            keywords: ["OpenAI", "", " AC-42 "],
+            languages: ["en", " fr "]
+        )
+        XCTAssertEqual(config.prompt, "A support call")
+        XCTAssertEqual(config.keywords, ["OpenAI", "AC-42"])
+        XCTAssertEqual(config.languages, ["en", "fr"])
+        XCTAssertEqual(parseSettingList("en, fr\n de"), ["en", "fr", "de"])
+    }
+
     func testMultipartContainsModelAndAudio() {
-        let multipart = buildMultipart(fields: ["model": "gpt-transcribe"], filename: "dictation.wav", file: Data("abc".utf8), mimeType: "audio/wav")
-        XCTAssertTrue(multipart.body.contains(Data("gpt-transcribe".utf8)))
+        let multipart = buildMultipart(fields: ["model": "gpt-realtime-transcribe"], filename: "dictation.wav", file: Data("abc".utf8), mimeType: "audio/wav")
+        XCTAssertTrue(multipart.body.contains(Data("gpt-realtime-transcribe".utf8)))
         XCTAssertTrue(multipart.body.contains(Data("dictation.wav".utf8)))
         XCTAssertTrue(multipart.body.contains(Data("abc".utf8)))
         XCTAssertTrue(multipart.body.contains(Data(multipart.boundary.utf8)))
+    }
+
+    func testMultipartContainsTranscriptionContextFields() {
+        let multipart = buildMultipart(
+            fields: ["model": "gpt-realtime-transcribe", "prompt": "A support call."],
+            repeatedFields: ["keywords[]": ["OpenAI", "AC-42"], "languages[]": ["en", "fr"]],
+            filename: "dictation.wav",
+            file: Data("abc".utf8),
+            mimeType: "audio/wav"
+        )
+        let body = String(data: multipart.body, encoding: .utf8)!
+        XCTAssertEqual(body.components(separatedBy: "name=\"keywords[]\"").count - 1, 2)
+        XCTAssertEqual(body.components(separatedBy: "name=\"languages[]\"").count - 1, 2)
+        XCTAssertTrue(multipart.body.contains(Data("A support call.".utf8)))
     }
 
     func testFailedRecordingIsSavedAsTheLatestWAV() throws {

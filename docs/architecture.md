@@ -21,7 +21,7 @@ WAV encoder (memory only)
        │ HTTPS multipart request
        ▼
 OpenAI /v1/audio/transcriptions
-       │ model=gpt-transcribe
+       │ model=gpt-realtime-transcribe
        ▼
 Transcript text
        │
@@ -50,11 +50,14 @@ Both clients send a multipart request to:
 
 ```text
 POST https://api.openai.com/v1/audio/transcriptions
-model=gpt-transcribe
+model=gpt-realtime-transcribe
 response_format=json
+prompt=<optional recording context>
+keywords[]=<optional literal term>  (repeated)
+languages[]=<optional language code> (repeated)
 ```
 
-An optional `language` hint is included when configured. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
+Optional `prompt`, `keywords[]`, and `languages[]` context settings are included when configured. The clients use the plural `languages` field and never send the legacy singular `language` field. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
 
 If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
 

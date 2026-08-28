@@ -43,6 +43,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(Config({"max_recording_seconds": 4}).max_recording_seconds, 5)
         self.assertEqual(Config({"max_recording_seconds": 999}).max_recording_seconds, 180)
 
+    def test_transcription_settings_normalize_and_keep_legacy_language(self):
+        config = Config(
+            {
+                "prompt": "  A product support call.  ",
+                "keywords": "OpenAI\nGPT Transcribe, API key",
+                "language": " en, fr ",
+            }
+        )
+        self.assertEqual(config.prompt, "A product support call.")
+        self.assertEqual(config.keywords, ["OpenAI", "GPT Transcribe", "API key"])
+        self.assertEqual(config.languages, ["en", "fr"])
+        self.assertEqual(config.language, "en")
+
     def test_unlimited_recording_does_not_start_a_timer(self):
         app = App()
         app.config.max_recording_seconds = 0
@@ -115,10 +128,38 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(core.transcribe_audio(b"audio", Config()), "hello")
         request = urlopen.call_args.args[0]
         self.assertIn(b"audio", request.data)
+        self.assertIn(core.MODEL.encode(), request.data)
+
+    def test_transcription_context_uses_documented_multipart_fields(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"text":"hello"}'
+
+        config = Config(
+            {
+                "prompt": "A support call.",
+                "keywords": ["OpenAI", "AC-42"],
+                "languages": ["en", "fr"],
+            }
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), patch(
+            "urllib.request.urlopen", return_value=Response()
+        ) as urlopen:
+            core.transcribe_audio(b"audio", config)
+        body = urlopen.call_args.args[0].data
+        self.assertIn(b'name="prompt"', body)
+        self.assertEqual(body.count(b'name="keywords[]"'), 2)
+        self.assertEqual(body.count(b'name="languages[]"'), 2)
 
     def test_multipart_contains_model_and_audio(self):
-        body, boundary = build_multipart({"model": "gpt-transcribe"}, "dictation.wav", b"abc", "audio/wav")
-        self.assertIn(b"gpt-transcribe", body)
+        body, boundary = build_multipart({"model": core.MODEL}, "dictation.wav", b"abc", "audio/wav")
+        self.assertIn(core.MODEL.encode(), body)
         self.assertIn(b"dictation.wav", body)
         self.assertIn(b"abc", body)
         self.assertIn(boundary.encode(), body)
