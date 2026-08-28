@@ -9,11 +9,15 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.7"
-private let model = "gpt-realtime-transcribe"
+private let appVersion = "0.3.8"
+let fileTranscriptionModel = "gpt-transcribe"
+let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
+let realtimeURL = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
+let realtimeSampleRate = 24_000
 private let defaultHotkey = "ctrl+shift+space"
 private let defaultMaxRecordingSeconds = 90
+let defaultRealtimeTranscription = true
 private let failedRecordingFilename = "failed-recording.wav"
 
 // MARK: - Local storage and logging
@@ -93,6 +97,7 @@ func parseSettingList(_ value: String) -> [String] {
 
 struct AppConfig {
     var hotkey: String = defaultHotkey
+    var realtimeTranscription: Bool = defaultRealtimeTranscription
     var prompt: String = ""
     var keywords: [String] = []
     var languages: [String] = []
@@ -101,6 +106,7 @@ struct AppConfig {
 
     init(
         hotkey: String = defaultHotkey,
+        realtimeTranscription: Bool = defaultRealtimeTranscription,
         language: String = "",
         prompt: String = "",
         keywords: [String] = [],
@@ -109,6 +115,7 @@ struct AppConfig {
         launchAtLogin: Bool = false
     ) {
         self.hotkey = hotkey
+        self.realtimeTranscription = realtimeTranscription
         self.prompt = prompt
         self.keywords = keywords
         self.languages = languages.isEmpty ? parseSettingList(language) : languages
@@ -119,6 +126,7 @@ struct AppConfig {
 
     init(defaults: UserDefaults = .standard) {
         self.hotkey = defaults.string(forKey: "hotkey") ?? defaultHotkey
+        self.realtimeTranscription = defaults.object(forKey: "realtimeTranscription") as? Bool ?? defaultRealtimeTranscription
         self.prompt = defaults.string(forKey: "prompt") ?? ""
         self.keywords = defaults.stringArray(forKey: "keywords") ?? []
         if let storedLanguages = defaults.stringArray(forKey: "languages") {
@@ -148,6 +156,7 @@ struct AppConfig {
 
     func save(to defaults: UserDefaults = .standard) {
         defaults.set(hotkey, forKey: "hotkey")
+        defaults.set(realtimeTranscription, forKey: "realtimeTranscription")
         defaults.set(prompt, forKey: "prompt")
         defaults.set(keywords, forKey: "keywords")
         defaults.set(languages, forKey: "languages")
@@ -399,8 +408,9 @@ final class AudioRecorder {
     private var pcmData = Data()
     private var sampleRate = 16_000
     private var recording = false
+    private var chunkHandler: ((Data, Int) -> Void)?
 
-    func start(completion: @escaping (Result<Int, Error>) -> Void) {
+    func start(onPCMChunk: ((Data, Int) -> Void)? = nil, completion: @escaping (Result<Int, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -413,17 +423,17 @@ final class AudioRecorder {
                         completion(.failure(AudioRecorderError.permissionDenied))
                         return
                     }
-                    self.configureAndStart(completion: completion)
+                    self.configureAndStart(onPCMChunk: onPCMChunk, completion: completion)
                 }
             case .authorized:
-                self.configureAndStart(completion: completion)
+                self.configureAndStart(onPCMChunk: onPCMChunk, completion: completion)
             @unknown default:
                 completion(.failure(AudioRecorderError.permissionDenied))
             }
         }
     }
 
-    private func configureAndStart(completion: @escaping (Result<Int, Error>) -> Void) {
+    private func configureAndStart(onPCMChunk: ((Data, Int) -> Void)?, completion: @escaping (Result<Int, Error>) -> Void) {
         do {
             let newEngine = AVAudioEngine()
             let input = newEngine.inputNode
@@ -438,6 +448,7 @@ final class AudioRecorder {
             sampleRate = Int(format.sampleRate.rounded())
             engine = newEngine
             recording = true
+            chunkHandler = onPCMChunk
             lock.unlock()
 
             input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
@@ -450,6 +461,7 @@ final class AudioRecorder {
             lock.lock()
             engine = nil
             recording = false
+            chunkHandler = nil
             lock.unlock()
             completion(.failure(AudioRecorderError.failed(error.localizedDescription)))
         }
@@ -473,10 +485,19 @@ final class AudioRecorder {
             samples.append(Int16(clamped * (clamped < 0 ? 32768 : 32767)))
         }
 
+        var chunk = Data()
+        samples.withUnsafeBytes { chunk.append(contentsOf: $0) }
+
         lock.lock()
-        defer { lock.unlock() }
-        guard recording else { return }
-        samples.withUnsafeBytes { pcmData.append(contentsOf: $0) }
+        guard recording else {
+            lock.unlock()
+            return
+        }
+        pcmData.append(chunk)
+        let handler = chunkHandler
+        let currentSampleRate = sampleRate
+        lock.unlock()
+        handler?(chunk, currentSampleRate)
     }
 
     func stop() -> AudioRecording {
@@ -486,6 +507,7 @@ final class AudioRecorder {
         engine = nil
         pcmData = Data()
         recording = false
+        chunkHandler = nil
         lock.unlock()
 
         if let currentEngine {
@@ -497,6 +519,244 @@ final class AudioRecorder {
 
     func cancel() {
         _ = stop()
+    }
+}
+
+final class PCM16Resampler {
+    private let inputRate: Double
+    private let outputRate: Double
+    private var pendingSamples = [Float]()
+    private var position: Double = 0
+
+    init(inputRate: Int, outputRate: Int = realtimeSampleRate) {
+        self.inputRate = Double(inputRate)
+        self.outputRate = Double(outputRate)
+    }
+
+    func convert(_ pcm: Data) -> Data {
+        guard inputRate != outputRate, pcm.count >= 2 else { return pcm }
+        let sampleCount = pcm.count / MemoryLayout<Int16>.size
+        let inputSamples: [Float] = pcm.withUnsafeBytes { rawBuffer in
+            let samples = rawBuffer.bindMemory(to: Int16.self)
+            return (0..<sampleCount).map { index in
+                Float(Int16(littleEndian: samples[index])) / 32768.0
+            }
+        }
+        pendingSamples.append(contentsOf: inputSamples)
+
+        let step = inputRate / outputRate
+        var outputSamples = [Int16]()
+        while position + 1 < Double(pendingSamples.count) {
+            let index = Int(position)
+            let fraction = Float(position - Double(index))
+            let sample = pendingSamples[index] + (pendingSamples[index + 1] - pendingSamples[index]) * fraction
+            let clamped = max(-1.0, min(1.0, sample))
+            outputSamples.append(Int16(clamped * (clamped < 0 ? 32768.0 : 32767.0)))
+            position += step
+        }
+
+        let consumed = Int(position)
+        if consumed > 0 {
+            pendingSamples.removeFirst(consumed)
+            position -= Double(consumed)
+        }
+
+        var output = Data()
+        outputSamples.withUnsafeBytes { output.append(contentsOf: $0) }
+        return output
+    }
+}
+
+func buildRealtimeSessionUpdate(config: AppConfig) -> [String: Any] {
+    var transcription: [String: Any] = [
+        "model": realtimeTranscriptionModel,
+        "delay": "low",
+    ]
+    if !config.prompt.isEmpty { transcription["prompt"] = config.prompt }
+    if !config.keywords.isEmpty { transcription["keywords"] = config.keywords }
+    if !config.languages.isEmpty { transcription["languages"] = config.languages }
+    return [
+        "type": "session.update",
+        "session": [
+            "type": "transcription",
+            "audio": [
+                "input": [
+                    "format": ["type": "audio/pcm", "rate": realtimeSampleRate],
+                    "transcription": transcription,
+                    "turn_detection": NSNull(),
+                ],
+            ],
+        ],
+    ]
+}
+
+final class RealtimeTranscriptionSession {
+    private let apiKey: String
+    private let config: AppConfig
+    private let queue = DispatchQueue(label: "com.gpttranscribe.realtime")
+    private var task: URLSessionWebSocketTask?
+    private var resampler: PCM16Resampler?
+    private var started = false
+    private var cancelled = false
+    private var sentAudio = false
+    private var transcriptDelta = ""
+    private var terminalResult: Result<String, Error>?
+    private var completion: ((Result<String, Error>) -> Void)?
+    private var resamplerInputRate: Int?
+
+    init(apiKey: String, config: AppConfig) {
+        self.apiKey = apiKey
+        self.config = config
+    }
+
+    func start() {
+        queue.async { [weak self] in
+            guard let self, !self.started, !self.cancelled else { return }
+            var request = URLRequest(url: realtimeURL)
+            request.setValue("Bearer \(self.apiKey)", forHTTPHeaderField: "Authorization")
+            let task = URLSession.shared.webSocketTask(with: request)
+            self.task = task
+            self.started = true
+            task.resume()
+            self.receiveNext()
+            self.sendEvent(buildRealtimeSessionUpdate(config: self.config))
+        }
+    }
+
+    func append(pcm: Data, sampleRate: Int) {
+        queue.async { [weak self] in
+            guard let self, self.started, !self.cancelled, self.terminalResult == nil else { return }
+            if self.resampler == nil || self.resamplerInputRate != sampleRate {
+                self.resampler = PCM16Resampler(inputRate: sampleRate)
+                self.resamplerInputRate = sampleRate
+            }
+            guard let resampler = self.resampler else { return }
+            let converted = resampler.convert(pcm)
+            guard !converted.isEmpty else { return }
+            self.sentAudio = true
+            self.sendEvent([
+                "type": "input_audio_buffer.append",
+                "audio": converted.base64EncodedString(),
+            ])
+        }
+    }
+
+    func finish(completion: @escaping (Result<String, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self, !self.cancelled else { return }
+            guard self.completion == nil else { return }
+            self.completion = completion
+            if let terminalResult = self.terminalResult {
+                self.complete(terminalResult)
+                return
+            }
+            guard self.started else {
+                self.fail("Realtime transcription did not start.")
+                return
+            }
+            guard self.sentAudio else {
+                self.fail("No audio was sent to OpenAI realtime transcription.")
+                return
+            }
+            self.sendEvent(["type": "input_audio_buffer.commit"])
+        }
+    }
+
+    func cancel() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.cancelled = true
+            self.completion = nil
+            self.task?.cancel(with: .goingAway, reason: nil)
+            self.task = nil
+        }
+    }
+
+    private func sendEvent(_ event: [String: Any]) {
+        guard let task = task, JSONSerialization.isValidJSONObject(event) else {
+            fail("Could not create the realtime transcription request.")
+            return
+        }
+        do {
+            let data = try JSONSerialization.data(withJSONObject: event)
+            guard let message = String(data: data, encoding: .utf8) else {
+                fail("Could not encode the realtime transcription request.")
+                return
+            }
+            task.send(.string(message)) { [weak self] error in
+                guard let error else { return }
+                self?.queue.async { [weak self] in
+                    self?.fail("Could not send realtime audio to OpenAI: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            fail("Could not encode the realtime transcription request: \(error.localizedDescription)")
+        }
+    }
+
+    private func receiveNext() {
+        task?.receive { [weak self] result in
+            self?.queue.async { [weak self] in
+                guard let self, !self.cancelled else { return }
+                switch result {
+                case .success(let message):
+                    self.handle(message)
+                    if self.terminalResult == nil { self.receiveNext() }
+                case .failure(let error):
+                    self.fail("Could not receive realtime transcription from OpenAI: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message) {
+        let data: Data
+        switch message {
+        case .string(let text):
+            data = Data(text.utf8)
+        case .data(let value):
+            data = value
+        @unknown default:
+            return
+        }
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let event = object as? [String: Any],
+            let type = event["type"] as? String
+        else {
+            fail("OpenAI returned an unreadable realtime event.")
+            return
+        }
+
+        switch type {
+        case "conversation.item.input_audio_transcription.delta":
+            if let delta = event["delta"] as? String { transcriptDelta += delta }
+        case "conversation.item.input_audio_transcription.completed":
+            let transcript = (event["transcript"] as? String ?? transcriptDelta)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            terminalResult = .success(transcript)
+            if completion != nil { complete(terminalResult!) }
+        case "error":
+            let error = event["error"] as? [String: Any]
+            fail(error?["message"] as? String ?? "OpenAI realtime transcription failed.")
+        default:
+            break
+        }
+    }
+
+    private func fail(_ message: String) {
+        terminalResult = .failure(TranscriptionError.request(String(message.prefix(400))))
+        if completion != nil { complete(terminalResult!) }
+    }
+
+    private func complete(_ result: Result<String, Error>) {
+        guard let completion else { return }
+        self.completion = nil
+        task?.cancel(with: .normalClosure, reason: nil)
+        task = nil
+        DispatchQueue.main.async {
+            completion(result)
+        }
     }
 }
 
@@ -613,7 +873,7 @@ func apiErrorMessage(data: Data, status: Int) -> String {
 
 final class TranscriptionClient {
     func transcribe(audio: Data, config: AppConfig, apiKey: String, completion: @escaping (Result<String, Error>) -> Void) {
-        var fields = ["model": model, "response_format": "json"]
+        var fields = ["model": fileTranscriptionModel, "response_format": "json"]
         if !config.prompt.isEmpty { fields["prompt"] = config.prompt }
         let multipart = buildMultipart(
             fields: fields,
@@ -774,6 +1034,7 @@ final class PasteableSecureTextField: NSSecureTextField {
 
 final class SettingsWindowController: NSWindowController {
     private let hotkeyField: NSTextField
+    private let realtimeTranscriptionButton: NSButton
     private let languagesField: NSTextField
     private let promptField: NSTextField
     private let keywordsField: NSTextField
@@ -786,6 +1047,7 @@ final class SettingsWindowController: NSWindowController {
 
     init(config: AppConfig, keychainKeyExists: Bool, saveHandler: @escaping (AppConfig, String) -> Void, removeKeyHandler: @escaping () -> Void) {
         self.hotkeyField = NSTextField(string: config.hotkey)
+        self.realtimeTranscriptionButton = NSButton(checkboxWithTitle: "Use realtime transcription (gpt-live-transcribe)", target: nil, action: nil)
         self.languagesField = NSTextField(string: config.languages.joined(separator: ", "))
         self.promptField = NSTextField(string: config.prompt)
         self.keywordsField = NSTextField(string: config.keywords.joined(separator: ", "))
@@ -797,7 +1059,7 @@ final class SettingsWindowController: NSWindowController {
         self.removeKeyHandler = removeKeyHandler
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 540),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -808,6 +1070,7 @@ final class SettingsWindowController: NSWindowController {
         super.init(window: window)
 
         hotkeyField.placeholderString = "ctrl+shift+space"
+        realtimeTranscriptionButton.state = config.realtimeTranscription ? .on : .off
         languagesField.placeholderString = "Optional, e.g. en, fr"
         promptField.placeholderString = "Optional context about the recording"
         keywordsField.placeholderString = "Optional, comma-separated terms"
@@ -844,6 +1107,7 @@ final class SettingsWindowController: NSWindowController {
 
         let grid = NSGridView(views: [
             [NSTextField(labelWithString: "Hotkey"), hotkeyField],
+            [NSTextField(labelWithString: "Transcription"), realtimeTranscriptionButton],
             [NSTextField(labelWithString: "Languages"), languagesField],
             [NSTextField(labelWithString: "Prompt"), promptField],
             [NSTextField(labelWithString: "Keywords"), keywordsField],
@@ -869,7 +1133,7 @@ final class SettingsWindowController: NSWindowController {
 
         stack.addArrangedSubview(launchAtLoginButton)
 
-        let note = NSTextField(labelWithString: "Audio stays in memory until you stop listening, then is sent to OpenAI. Prompt, keywords, and language hints are optional. The API key is never written to the settings file.")
+        let note = NSTextField(labelWithString: "Realtime mode streams 24 kHz microphone audio while you listen; off uploads the completed recording. Prompt, keywords, and language hints are optional. The API key is never written to the settings file.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
         note.maximumNumberOfLines = 2
@@ -936,6 +1200,7 @@ final class SettingsWindowController: NSWindowController {
     @objc private func saveClicked() {
         var config = AppConfig(
             hotkey: hotkeyField.stringValue,
+            realtimeTranscription: realtimeTranscriptionButton.state == .on,
             prompt: promptField.stringValue,
             keywords: parseSettingList(keywordsField.stringValue),
             languages: parseSettingList(languagesField.stringValue),
@@ -981,6 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let transcriptionClient = TranscriptionClient()
     private let hotKeyManager = HotKeyManager()
     private var config = AppConfig()
+    private var realtimeSession: RealtimeTranscriptionSession?
     private var state: State = .idle
     private var status = "Ready"
     private var statusItem: NSStatusItem!
@@ -1010,6 +1276,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         recordingTimer?.invalidate()
         recordingTimer = nil
+        realtimeSession?.cancel()
+        realtimeSession = nil
         audioRecorder.cancel()
         hotKeyManager.unregister()
         logger.info("Stopped")
@@ -1102,7 +1370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startRecording() {
-        guard KeychainStore.configuredValue != nil else {
+        guard let apiKey = KeychainStore.configuredValue else {
             setStatus("Add an API key in Settings", notify: true)
             openSettings()
             return
@@ -1112,8 +1380,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         state = .starting
         targetApplication = currentTargetApplication()
+        let configSnapshot = config
+        let session = configSnapshot.realtimeTranscription
+            ? RealtimeTranscriptionSession(apiKey: apiKey, config: configSnapshot)
+            : nil
+        realtimeSession = session
+        session?.start()
         updateStatusItem()
-        audioRecorder.start { [weak self] result in
+        audioRecorder.start(onPCMChunk: { [weak self] pcm, sampleRate in
+            self?.realtimeSession?.append(pcm: pcm, sampleRate: sampleRate)
+        }) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
@@ -1130,6 +1406,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     }
                 case .failure(let error):
+                    self.realtimeSession?.cancel()
+                    self.realtimeSession = nil
                     self.state = .idle
                     self.setStatus(error.localizedDescription, notify: true)
                 }
@@ -1143,6 +1421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingTimer?.invalidate()
         recordingTimer = nil
         let recording = audioRecorder.stop()
+        let activeRealtimeSession = realtimeSession
+        realtimeSession = nil
         let target = targetApplication
         targetApplication = nil
         status = "Transcribing…"
@@ -1150,24 +1430,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let audio = makeWAV(pcm: recording.pcm, sampleRate: recording.sampleRate)
         guard audio.count >= 1_000 else {
+            activeRealtimeSession?.cancel()
             finish(status: "No audio captured", notify: true)
             return
         }
-        transcribeAndPaste(audio: audio, target: target, pendingURL: nil)
+        transcribeAndPaste(audio: audio, target: target, pendingURL: nil, realtimeSession: activeRealtimeSession)
     }
 
-    private func transcribeAndPaste(audio: Data, target: NSRunningApplication?, pendingURL: URL?) {
+    private func transcribeAndPaste(
+        audio: Data,
+        target: NSRunningApplication?,
+        pendingURL: URL?,
+        realtimeSession: RealtimeTranscriptionSession? = nil
+    ) {
         guard audio.count >= 1_000 else {
+            realtimeSession?.cancel()
             finish(status: "No audio captured", notify: true)
             return
         }
         guard let apiKey = KeychainStore.configuredValue else {
+            realtimeSession?.cancel()
             let saved = saveForRetry(audio)
             finish(status: failureStatus(TranscriptionError.missingAPIKey.localizedDescription, saved: saved), notify: true)
             return
         }
         let configSnapshot = config
-        transcriptionClient.transcribe(audio: audio, config: configSnapshot, apiKey: apiKey) { [weak self] result in
+        let handleResult: (Result<String, Error>) -> Void = { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
@@ -1202,6 +1490,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                 }
             }
+        }
+        if let realtimeSession {
+            realtimeSession.finish(completion: handleResult)
+        } else {
+            transcriptionClient.transcribe(audio: audio, config: configSnapshot, apiKey: apiKey, completion: handleResult)
         }
     }
 

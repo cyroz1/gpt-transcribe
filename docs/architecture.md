@@ -14,14 +14,15 @@ Platform hotkey registration
        ▼
 Native microphone capture ──► in-memory PCM chunks
        │
-       │ hotkey pressed again / max duration reached
-       ▼
-WAV encoder (memory only)
+       │ settings toggle
+       ├─ realtime on ──► resample to 24 kHz ──► Realtime WebSocket
+       │                                           model=gpt-live-transcribe
+       └─ realtime off ─► hotkey pressed again / max duration reached
+                              ▼
+                         WAV encoder ──► HTTPS multipart request
+                                           model=gpt-transcribe
        │
-       │ HTTPS multipart request
-       ▼
-OpenAI /v1/audio/transcriptions
-       │ model=gpt-realtime-transcribe
+       │ transcription completed
        ▼
 Transcript text
        │
@@ -46,11 +47,11 @@ When recording stops, both implementations wrap the PCM bytes in a standard mono
 
 ### Transcription request
 
-Both clients send a multipart request to:
+With realtime mode off, both clients send a multipart request to:
 
 ```text
 POST https://api.openai.com/v1/audio/transcriptions
-model=gpt-realtime-transcribe
+model=gpt-transcribe
 response_format=json
 prompt=<optional recording context>
 keywords[]=<optional literal term>  (repeated)
@@ -58,6 +59,8 @@ languages[]=<optional language code> (repeated)
 ```
 
 Optional `prompt`, `keywords[]`, and `languages[]` context settings are included when configured. The clients use the plural `languages` field and never send the legacy singular `language` field. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
+
+With realtime mode on, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, sends a `session.update` selecting `gpt-live-transcribe`, and streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`. The session uses `turn_detection: null`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented transcription delta and completed events. The same prompt, keywords, and language context settings are included in the realtime session update.
 
 If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
 

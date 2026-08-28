@@ -1,8 +1,11 @@
+import base64
 import io
 import json
 import os
+import queue
 import sys
 import tempfile
+import types
 import unittest
 import wave
 from pathlib import Path
@@ -11,7 +14,16 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import gpt_transcribe as core  # noqa: E402
-from gpt_transcribe import Config, App, build_multipart, make_wav, parse_hotkey, startup_command  # noqa: E402
+from gpt_transcribe import (  # noqa: E402
+    App,
+    Config,
+    RealtimeTranscriptionSession,
+    build_multipart,
+    build_realtime_session_update,
+    make_wav,
+    parse_hotkey,
+    startup_command,
+)
 
 
 class CoreTests(unittest.TestCase):
@@ -55,6 +67,97 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(config.keywords, ["OpenAI", "GPT Transcribe", "API key"])
         self.assertEqual(config.languages, ["en", "fr"])
         self.assertEqual(config.language, "en")
+
+    def test_realtime_setting_defaults_on_and_normalizes_values(self):
+        self.assertTrue(Config().realtime_transcription)
+        self.assertTrue(Config({"realtime_transcription": "yes"}).realtime_transcription)
+        self.assertFalse(Config({"realtime_transcription": "off"}).realtime_transcription)
+
+    def test_realtime_session_update_uses_documented_live_model_and_context(self):
+        update = build_realtime_session_update(
+            Config(
+                {
+                    "prompt": "A support call.",
+                    "keywords": ["OpenAI", "AC-42"],
+                    "languages": ["en", "fr"],
+                }
+            )
+        )
+        session = update["session"]
+        audio_input = session["audio"]["input"]
+        self.assertEqual(update["type"], "session.update")
+        self.assertEqual(session["type"], "transcription")
+        self.assertEqual(audio_input["format"], {"type": "audio/pcm", "rate": 24_000})
+        self.assertIsNone(audio_input["turn_detection"])
+        self.assertEqual(audio_input["transcription"]["model"], core.REALTIME_TRANSCRIPTION_MODEL)
+        self.assertEqual(audio_input["transcription"]["delay"], "low")
+        self.assertEqual(audio_input["transcription"]["languages"], ["en", "fr"])
+
+    def test_realtime_session_streams_audio_and_commits(self):
+        class FakeTimeout(Exception):
+            pass
+
+        class FakeSocket:
+            def __init__(self):
+                self.events = queue.Queue()
+                self.sent = []
+                self.url = None
+                self.headers = None
+                self.closed = False
+
+            def settimeout(self, _timeout):
+                return None
+
+            def send(self, payload):
+                event = json.loads(payload)
+                self.sent.append(event)
+                if event.get("type") == "input_audio_buffer.commit":
+                    self.events.put(
+                        json.dumps(
+                            {
+                                "type": "conversation.item.input_audio_transcription.completed",
+                                "transcript": "hello from realtime",
+                            }
+                        )
+                    )
+
+            def recv(self):
+                try:
+                    return self.events.get(timeout=0.2)
+                except queue.Empty as exc:
+                    raise FakeTimeout() from exc
+
+            def close(self):
+                self.closed = True
+
+        fake_socket = FakeSocket()
+
+        def create_connection(url, header, timeout):
+            fake_socket.url = url
+            fake_socket.headers = header
+            self.assertEqual(timeout, 10)
+            return fake_socket
+
+        fake_websocket = types.SimpleNamespace(
+            create_connection=create_connection,
+            WebSocketTimeoutException=FakeTimeout,
+        )
+        config = Config()
+        with patch.dict(sys.modules, {"websocket": fake_websocket}):
+            session = RealtimeTranscriptionSession("test-key", config)
+            session.start()
+            pcm = b"\x01\x00" * 120
+            session.append_audio(pcm, 24_000)
+            self.assertEqual(session.finish(), "hello from realtime")
+
+        self.assertEqual(fake_socket.url, core.REALTIME_URL)
+        self.assertEqual(fake_socket.headers, ["Authorization: Bearer test-key"])
+        self.assertEqual(fake_socket.sent[0]["type"], "session.update")
+        self.assertEqual(fake_socket.sent[0]["session"]["audio"]["input"]["transcription"]["model"], core.REALTIME_TRANSCRIPTION_MODEL)
+        append_events = [event for event in fake_socket.sent if event["type"] == "input_audio_buffer.append"]
+        self.assertTrue(append_events)
+        self.assertEqual(base64.b64decode(append_events[0]["audio"]), pcm)
+        self.assertEqual(fake_socket.sent[-1]["type"], "input_audio_buffer.commit")
 
     def test_unlimited_recording_does_not_start_a_timer(self):
         app = App()
@@ -128,7 +231,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(core.transcribe_audio(b"audio", Config()), "hello")
         request = urlopen.call_args.args[0]
         self.assertIn(b"audio", request.data)
-        self.assertIn(core.MODEL.encode(), request.data)
+        self.assertIn(core.FILE_TRANSCRIPTION_MODEL.encode(), request.data)
 
     def test_transcription_context_uses_documented_multipart_fields(self):
         class Response:
@@ -158,8 +261,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(body.count(b'name="languages[]"'), 2)
 
     def test_multipart_contains_model_and_audio(self):
-        body, boundary = build_multipart({"model": core.MODEL}, "dictation.wav", b"abc", "audio/wav")
-        self.assertIn(core.MODEL.encode(), body)
+        body, boundary = build_multipart({"model": core.FILE_TRANSCRIPTION_MODEL}, "dictation.wav", b"abc", "audio/wav")
+        self.assertIn(core.FILE_TRANSCRIPTION_MODEL.encode(), body)
         self.assertIn(b"dictation.wav", body)
         self.assertIn(b"abc", body)
         self.assertIn(boundary.encode(), body)

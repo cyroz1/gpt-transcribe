@@ -44,9 +44,38 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertEqual(parseSettingList("en, fr\n de"), ["en", "fr", "de"])
     }
 
+    func testRealtimeSettingDefaultsOnAndCanBeDisabled() {
+        XCTAssertTrue(AppConfig().realtimeTranscription)
+        XCTAssertFalse(AppConfig(realtimeTranscription: false).realtimeTranscription)
+    }
+
+    func testRealtimeSessionUpdateUsesDocumentedLiveModelAndContext() {
+        let config = AppConfig(
+            realtimeTranscription: true,
+            prompt: "A support call.",
+            keywords: ["OpenAI", "AC-42"],
+            languages: ["en", "fr"]
+        )
+        let update = buildRealtimeSessionUpdate(config: config)
+        let session = update["session"] as! [String: Any]
+        let audio = session["audio"] as! [String: Any]
+        let input = audio["input"] as! [String: Any]
+        let format = input["format"] as! [String: Any]
+        let transcription = input["transcription"] as! [String: Any]
+
+        XCTAssertEqual(update["type"] as? String, "session.update")
+        XCTAssertEqual(session["type"] as? String, "transcription")
+        XCTAssertEqual(format["type"] as? String, "audio/pcm")
+        XCTAssertEqual(format["rate"] as? Int, realtimeSampleRate)
+        XCTAssertTrue(input["turn_detection"] is NSNull)
+        XCTAssertEqual(transcription["model"] as? String, realtimeTranscriptionModel)
+        XCTAssertEqual(transcription["delay"] as? String, "low")
+        XCTAssertEqual(transcription["languages"] as? [String], ["en", "fr"])
+    }
+
     func testMultipartContainsModelAndAudio() {
-        let multipart = buildMultipart(fields: ["model": "gpt-realtime-transcribe"], filename: "dictation.wav", file: Data("abc".utf8), mimeType: "audio/wav")
-        XCTAssertTrue(multipart.body.contains(Data("gpt-realtime-transcribe".utf8)))
+        let multipart = buildMultipart(fields: ["model": fileTranscriptionModel], filename: "dictation.wav", file: Data("abc".utf8), mimeType: "audio/wav")
+        XCTAssertTrue(multipart.body.contains(Data(fileTranscriptionModel.utf8)))
         XCTAssertTrue(multipart.body.contains(Data("dictation.wav".utf8)))
         XCTAssertTrue(multipart.body.contains(Data("abc".utf8)))
         XCTAssertTrue(multipart.body.contains(Data(multipart.boundary.utf8)))
@@ -54,7 +83,7 @@ final class GPTTranscribeMacTests: XCTestCase {
 
     func testMultipartContainsTranscriptionContextFields() {
         let multipart = buildMultipart(
-            fields: ["model": "gpt-realtime-transcribe", "prompt": "A support call."],
+            fields: ["model": fileTranscriptionModel, "prompt": "A support call."],
             repeatedFields: ["keywords[]": ["OpenAI", "AC-42"], "languages[]": ["en", "fr"]],
             filename: "dictation.wav",
             file: Data("abc".utf8),

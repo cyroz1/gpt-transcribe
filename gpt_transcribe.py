@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -28,12 +29,20 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.7"
-MODEL = "gpt-realtime-transcribe"
+APP_VERSION = "0.3.8"
+FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
+REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
+# Keep MODEL as the file-transcription default for callers that imported the
+# old constant. The realtime model is selected explicitly by Config.
+MODEL = FILE_TRANSCRIPTION_MODEL
 TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
+REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
+REALTIME_SAMPLE_RATE = 24_000
 DEFAULT_HOTKEY = "ctrl+shift+space"
 DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_MAX_RECORDING_SECONDS = 90
+DEFAULT_REALTIME_TRANSCRIPTION = True
+REALTIME_COMPLETION_TIMEOUT = 30
 MIN_MAX_RECORDING_SECONDS = 5
 MAX_MAX_RECORDING_SECONDS = 180
 FAILED_RECORDING_FILENAME = "failed-recording.wav"
@@ -275,6 +284,9 @@ class Config:
         values = values or {}
         self.launch_on_login = self._as_bool(values.get("launch_on_login", False))
         self.hotkey = str(values.get("hotkey", DEFAULT_HOTKEY)).strip().lower() or DEFAULT_HOTKEY
+        self.realtime_transcription = self._as_bool(
+            values.get("realtime_transcription", DEFAULT_REALTIME_TRANSCRIPTION)
+        )
         self.prompt = str(values.get("prompt") or "").strip()
         self.keywords = parse_setting_list(values.get("keywords", []))
         languages = values.get("languages")
@@ -350,6 +362,7 @@ class Config:
         payload = {
             "launch_on_login": self.launch_on_login,
             "hotkey": self.hotkey,
+            "realtime_transcription": self.realtime_transcription,
             "prompt": self.prompt,
             "keywords": self.keywords,
             "languages": self.languages,
@@ -361,6 +374,32 @@ class Config:
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
         temporary.replace(config_path())
+
+
+def build_realtime_session_update(config: Config) -> dict[str, object]:
+    transcription: dict[str, object] = {
+        "model": REALTIME_TRANSCRIPTION_MODEL,
+        "delay": "low",
+    }
+    if config.prompt:
+        transcription["prompt"] = config.prompt
+    if config.keywords:
+        transcription["keywords"] = config.keywords
+    if config.languages:
+        transcription["languages"] = config.languages
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
+                    "transcription": transcription,
+                    "turn_detection": None,
+                }
+            },
+        },
+    }
 
 
 MODIFIER_CODES = {
@@ -478,6 +517,235 @@ def _api_error_message(response_bytes: bytes, status: int) -> str:
     return f"Transcription request failed with HTTP {status}."
 
 
+class PCM16Resampler:
+    """Convert mono little-endian PCM16 chunks to the Realtime sample rate."""
+
+    def __init__(self, input_rate: int, output_rate: int = REALTIME_SAMPLE_RATE) -> None:
+        self.input_rate = int(input_rate)
+        self.output_rate = int(output_rate)
+        self._rate_state = None
+
+    def convert(self, pcm_bytes: bytes) -> bytes:
+        if self.input_rate == self.output_rate:
+            return pcm_bytes
+        import audioop
+
+        converted, self._rate_state = audioop.ratecv(
+            pcm_bytes,
+            2,
+            1,
+            self.input_rate,
+            self.output_rate,
+            self._rate_state,
+        )
+        return converted
+
+
+class RealtimeTranscriptionSession:
+    """Stream microphone PCM to gpt-live-transcribe over a Realtime WebSocket."""
+
+    def __init__(self, api_key: str, config: Config) -> None:
+        self.api_key = api_key
+        self.config = config
+        self._websocket = None
+        self._audio_queue: queue.Queue[bytes | None] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._cancelled = threading.Event()
+        self._completed_event = threading.Event()
+        self._error_event = threading.Event()
+        self._error: TranscriptionError | None = None
+        self._transcript = ""
+        self._sent_audio = False
+        self._resampler: PCM16Resampler | None = None
+        self._resampler_lock = threading.Lock()
+        self._socket = None
+        self._socket_lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Realtime transcription has already started.")
+        try:
+            import websocket
+        except ImportError as exc:  # pragma: no cover - dependency-specific
+            raise TranscriptionError(
+                "Realtime transcription requires the websocket-client package."
+            ) from exc
+        self._websocket = websocket
+        self._thread = threading.Thread(
+            target=self._run,
+            name="GPTTranscribeRealtime",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def append_audio(self, pcm_bytes: bytes | bytearray | memoryview, sample_rate: int) -> None:
+        if self._stop_event.is_set() or self._cancelled.is_set():
+            return
+        try:
+            with self._resampler_lock:
+                if self._resampler is None or self._resampler.input_rate != int(sample_rate):
+                    self._resampler = PCM16Resampler(int(sample_rate))
+                converted = self._resampler.convert(bytes(pcm_bytes))
+            if converted:
+                self._audio_queue.put(converted)
+        except Exception as exc:  # pragma: no cover - audio/runtime-specific
+            self._set_error(f"Could not prepare realtime audio: {exc}")
+
+    def finish(self) -> str:
+        if self._thread is None:
+            raise TranscriptionError("Realtime transcription did not start.")
+        self._stop_event.set()
+        self._audio_queue.put(None)
+        self._thread.join(timeout=REALTIME_COMPLETION_TIMEOUT + 15)
+        if self._thread.is_alive():
+            self.cancel()
+            raise TranscriptionError("Realtime transcription timed out.")
+        if self._error is not None:
+            raise self._error
+        if not self._completed_event.is_set():
+            raise TranscriptionError("OpenAI returned no realtime transcript.")
+        return self._transcript.strip()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self._stop_event.set()
+        self._audio_queue.put(None)
+        self._close_socket()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        websocket = self._websocket
+        socket = None
+        reader = None
+        try:
+            socket = websocket.create_connection(
+                REALTIME_URL,
+                header=[f"Authorization: Bearer {self.api_key}"],
+                timeout=10,
+            )
+            socket.settimeout(0.2)
+            with self._socket_lock:
+                self._socket = socket
+            self._send_event(build_realtime_session_update(self.config))
+            reader = threading.Thread(
+                target=self._read_events,
+                args=(socket,),
+                name="GPTTranscribeRealtimeReader",
+                daemon=True,
+            )
+            self._reader_thread = reader
+            reader.start()
+
+            while not self._error_event.is_set():
+                try:
+                    item = self._audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                self._send_event(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": _bytes_to_base64(item),
+                    }
+                )
+                self._sent_audio = True
+
+            if self._cancelled.is_set() or self._error_event.is_set():
+                return
+            if not self._sent_audio:
+                self._set_error("No audio was sent to OpenAI realtime transcription.")
+                return
+            self._send_event({"type": "input_audio_buffer.commit"})
+            if not self._completed_event.wait(REALTIME_COMPLETION_TIMEOUT):
+                self._set_error("Realtime transcription timed out.")
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                self._set_error(self._connection_error_message(exc))
+        finally:
+            self._close_socket(socket)
+            if reader and reader is not threading.current_thread():
+                reader.join(timeout=1)
+
+    def _read_events(self, socket) -> None:
+        websocket = self._websocket
+        while not self._stop_event.is_set() or not self._completed_event.is_set():
+            try:
+                message = socket.recv()
+            except websocket.WebSocketTimeoutException:
+                if self._cancelled.is_set() or self._error_event.is_set():
+                    return
+                continue
+            except Exception as exc:
+                if not self._cancelled.is_set() and not self._completed_event.is_set():
+                    self._set_error(self._connection_error_message(exc))
+                return
+            if not message:
+                continue
+            try:
+                event = json.loads(message.decode("utf-8") if isinstance(message, bytes) else message)
+            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                self._set_error(f"OpenAI returned an unreadable realtime event: {exc}")
+                return
+            self._handle_event(event)
+            if self._error_event.is_set() or self._completed_event.is_set():
+                return
+
+    def _handle_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if event_type == "conversation.item.input_audio_transcription.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                self._transcript += delta
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            transcript = event.get("transcript")
+            if isinstance(transcript, str):
+                self._transcript = transcript
+            self._completed_event.set()
+        elif event_type == "error":
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            self._set_error(str(message or "OpenAI realtime transcription failed."))
+
+    def _send_event(self, event: dict[str, object]) -> None:
+        payload = json.dumps(event, separators=(",", ":"))
+        with self._socket_lock:
+            if self._socket is None:
+                raise TranscriptionError("Realtime WebSocket is not connected.")
+            self._socket.send(payload)
+
+    def _set_error(self, message: str) -> None:
+        if self._error is None:
+            self._error = TranscriptionError(message[:400])
+        self._error_event.set()
+
+    @staticmethod
+    def _connection_error_message(exc: BaseException) -> str:
+        message = str(exc).strip()
+        return f"Could not reach OpenAI realtime transcription: {message}" if message else "Could not reach OpenAI realtime transcription."
+
+    def _close_socket(self, socket=None) -> None:
+        with self._socket_lock:
+            target = socket or self._socket
+            self._socket = None
+            if target is not None:
+                try:
+                    target.close()
+                except Exception:
+                    pass
+
+
+def _bytes_to_base64(value: bytes) -> str:
+    import base64
+
+    return base64.b64encode(value).decode("ascii")
+
+
 def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
     import urllib.error as urllib_error
     import urllib.request as urllib_request
@@ -485,7 +753,7 @@ def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise TranscriptionError("OPENAI_API_KEY is not available to this app.")
-    fields: dict[str, str | list[str]] = {"model": MODEL, "response_format": "json"}
+    fields: dict[str, str | list[str]] = {"model": FILE_TRANSCRIPTION_MODEL, "response_format": "json"}
     if config.prompt:
         fields["prompt"] = config.prompt
     if config.keywords:
@@ -658,6 +926,7 @@ class App:
         self.hotkey_thread_id: int | None = None
         self.icon = None
         self.stream = None
+        self.realtime_session: RealtimeTranscriptionSession | None = None
         self.recording_timer: threading.Timer | None = None
         self.audio_buffer = bytearray()
         self.audio_status_logged = False
@@ -746,6 +1015,12 @@ class App:
         if not os.environ.get("OPENAI_API_KEY", "").strip():
             self._set_status("Missing OPENAI_API_KEY", notify=True)
             return
+        if self.config.realtime_transcription and not _module_available("websocket"):
+            self._set_status(
+                "Realtime transcription is unavailable. Install websocket-client or turn it off in Settings.",
+                notify=True,
+            )
+            return
         with self.state_lock:
             if self.state != "idle":
                 return
@@ -790,6 +1065,25 @@ class App:
                     self.state = "idle"
                 self._set_status("Microphone unavailable", notify=True)
                 return
+        realtime_session = None
+        if self.config.realtime_transcription:
+            try:
+                realtime_session = RealtimeTranscriptionSession(
+                    os.environ["OPENAI_API_KEY"].strip(),
+                    Config(self.config.__dict__),
+                )
+                realtime_session.start()
+            except Exception as exc:
+                log_exception("Could not start realtime transcription", exc)
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+                with self.state_lock:
+                    self.state = "idle"
+                self._set_status(str(exc), notify=True)
+                return
         with self.state_lock:
             if self.stop_event.is_set():
                 try:
@@ -797,10 +1091,13 @@ class App:
                     stream.close()
                 except Exception:
                     pass
+                if realtime_session:
+                    realtime_session.cancel()
                 self.state = "idle"
                 return
             self.stream = stream
             self.audio_sample_rate = int(round(float(getattr(stream, "samplerate", self.config.sample_rate))))
+            self.realtime_session = realtime_session
             self.state = "recording"
             self.status = "Listening… press the hotkey to finish"
             self.icon.update_menu()
@@ -819,14 +1116,21 @@ class App:
 
     def _audio_callback(self, indata, _frames, _time_info, status) -> None:
         log_status = False
+        pcm_bytes = bytes(indata)
+        realtime_session = None
+        sample_rate = REALTIME_SAMPLE_RATE
         with self.state_lock:
             if self.state == "recording":
-                self.audio_buffer.extend(indata)
+                self.audio_buffer.extend(pcm_bytes)
+                realtime_session = self.realtime_session
+                sample_rate = self.audio_sample_rate
                 if status and not self.audio_status_logged:
                     self.audio_status_logged = True
                     log_status = True
         if log_status:
             LOGGER.warning("Audio status: %s", status)
+        if realtime_session and pcm_bytes:
+            realtime_session.append_audio(pcm_bytes, sample_rate)
 
     def stop_recording(self) -> None:
         with self.state_lock:
@@ -839,6 +1143,8 @@ class App:
             self.audio_buffer = bytearray()
             sample_rate = self.audio_sample_rate
             target_window = self.target_window
+            realtime_session = self.realtime_session
+            self.realtime_session = None
             if self.recording_timer:
                 self.recording_timer.cancel()
                 self.recording_timer = None
@@ -855,11 +1161,13 @@ class App:
         audio_bytes = make_wav(pcm_buffer, sample_rate)
         del pcm_buffer
         if len(audio_bytes) < 1_000:
+            if realtime_session:
+                realtime_session.cancel()
             self._finish_with_status("No audio captured", notify=True)
             return
         worker = threading.Thread(
             target=self._transcribe_and_paste,
-            args=(audio_bytes, target_window),
+            args=(audio_bytes, target_window, None, realtime_session),
             name="GPTTranscribeRequest",
             daemon=True,
         )
@@ -903,9 +1211,14 @@ class App:
         audio_bytes: bytes,
         target_window: int | None,
         pending_path: Path | None = None,
+        realtime_session: RealtimeTranscriptionSession | None = None,
     ) -> None:
         try:
-            transcript = transcribe_audio(audio_bytes, self.config)
+            transcript = (
+                realtime_session.finish()
+                if realtime_session is not None
+                else transcribe_audio(audio_bytes, self.config)
+            )
             if not transcript:
                 saved = self._save_for_retry(audio_bytes, target_window)
                 self._finish_with_status(self._failure_status("No speech detected", saved), notify=True)
@@ -1068,24 +1381,31 @@ class App:
             hotkey = tk.StringVar(value=self.config.hotkey)
             ttk.Entry(frame, textvariable=hotkey, width=24).grid(row=1, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Languages (optional)").grid(row=2, column=0, sticky="w", pady=4)
-            languages = tk.StringVar(value=", ".join(self.config.languages))
-            ttk.Entry(frame, textvariable=languages, width=24).grid(row=2, column=1, sticky="ew", pady=4)
+            realtime_transcription = tk.BooleanVar(value=self.config.realtime_transcription)
+            ttk.Checkbutton(
+                frame,
+                text="Use realtime transcription (gpt-live-transcribe)",
+                variable=realtime_transcription,
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
 
-            ttk.Label(frame, text="Prompt (optional)").grid(row=3, column=0, sticky="nw", pady=4)
+            ttk.Label(frame, text="Languages (optional)").grid(row=3, column=0, sticky="w", pady=4)
+            languages = tk.StringVar(value=", ".join(self.config.languages))
+            ttk.Entry(frame, textvariable=languages, width=24).grid(row=3, column=1, sticky="ew", pady=4)
+
+            ttk.Label(frame, text="Prompt (optional)").grid(row=4, column=0, sticky="nw", pady=4)
             prompt = tk.Text(frame, width=32, height=3, wrap="word")
             prompt.insert("1.0", self.config.prompt)
-            prompt.grid(row=3, column=1, sticky="ew", pady=4)
+            prompt.grid(row=4, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Keywords (optional)").grid(row=4, column=0, sticky="nw", pady=4)
+            ttk.Label(frame, text="Keywords (optional)").grid(row=5, column=0, sticky="nw", pady=4)
             keywords = tk.Text(frame, width=32, height=3, wrap="word")
             keywords.insert("1.0", "\n".join(self.config.keywords))
-            keywords.grid(row=4, column=1, sticky="ew", pady=4)
+            keywords.grid(row=5, column=1, sticky="ew", pady=4)
 
-            ttk.Label(frame, text="Max seconds (0 = unlimited)").grid(row=5, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text="Max seconds (0 = unlimited)").grid(row=6, column=0, sticky="w", pady=4)
             max_seconds = tk.StringVar(value=str(self.config.max_recording_seconds) if self.config.max_recording_seconds else "")
             ttk.Spinbox(frame, from_=0, to=180, textvariable=max_seconds, width=22).grid(
-                row=5, column=1, sticky="ew", pady=4
+                row=6, column=1, sticky="ew", pady=4
             )
 
             device_ids: list[int | None] = [None]
@@ -1102,11 +1422,11 @@ class App:
                             device_labels.append(f"{index}: {device_info.get('name', 'Microphone')}")
                 except Exception as exc:
                     log_exception("Could not enumerate microphones", exc)
-            ttk.Label(frame, text="Microphone").grid(row=6, column=0, sticky="w", pady=4)
+            ttk.Label(frame, text="Microphone").grid(row=7, column=0, sticky="w", pady=4)
             selected_index = device_ids.index(self.config.audio_device) if self.config.audio_device in device_ids else 0
             device = tk.StringVar(value=device_labels[selected_index])
             ttk.Combobox(frame, textvariable=device, values=device_labels, state="readonly", width=21).grid(
-                row=6, column=1, sticky="ew", pady=4
+                row=7, column=1, sticky="ew", pady=4
             )
 
             launch_on_login = tk.BooleanVar(value=self.config.launch_on_login)
@@ -1114,16 +1434,16 @@ class App:
                 frame,
                 text="Launch GPT Transcribe when I sign in",
                 variable=launch_on_login,
-            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=4)
+            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=4)
 
             ttk.Label(
                 frame,
-                text="Audio is sent to OpenAI after you stop listening. Prompt, keywords, and language hints are optional.\nThe API key is read from OPENAI_API_KEY and never saved here.",
+                text="Realtime mode streams 24 kHz microphone audio while you listen; off uploads the completed recording. Prompt, keywords, and language hints are optional.\nThe API key is read from OPENAI_API_KEY and never saved here.",
                 foreground="#555555",
-            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 12))
+            ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 12))
 
             buttons = ttk.Frame(frame)
-            buttons.grid(row=9, column=0, columnspan=2, sticky="e")
+            buttons.grid(row=10, column=0, columnspan=2, sticky="e")
 
             def save_and_close() -> None:
                 try:
@@ -1145,6 +1465,7 @@ class App:
                     )
                     return
                 self.config.hotkey = hotkey.get().strip().lower()
+                self.config.realtime_transcription = bool(realtime_transcription.get())
                 self.config.languages = parse_setting_list(languages.get())
                 self.config.prompt = prompt.get("1.0", "end-1c").strip()
                 self.config.keywords = parse_setting_list(keywords.get("1.0", "end-1c"))
@@ -1187,6 +1508,7 @@ def check_installation() -> int:
         "Windows": sys.platform == "win32",
         "OPENAI_API_KEY present": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
         "sounddevice installed": _module_available("sounddevice"),
+        "websocket-client installed": _module_available("websocket"),
         "pystray installed": _module_available("pystray"),
         "Pillow installed": _module_available("PIL"),
     }

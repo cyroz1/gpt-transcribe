@@ -18,6 +18,7 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     --windowed `
     --name GPTTranscribe `
     --collect-all sounddevice `
+    --hidden-import websocket `
     (Join-Path $projectRoot 'gpt_transcribe.py')
 
 $outputDirectory = Join-Path $projectRoot 'outputs'
