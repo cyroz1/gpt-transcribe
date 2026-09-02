@@ -9,7 +9,7 @@ import types
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -73,6 +73,18 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(Config({"realtime_transcription": "yes"}).realtime_transcription)
         self.assertFalse(Config({"realtime_transcription": "off"}).realtime_transcription)
 
+    def test_mode_menu_toggle_switches_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
+            app = App()
+            self.assertTrue(app.config.realtime_transcription)
+            app._menu_toggle_mode(None, None)
+            self.assertFalse(app.config.realtime_transcription)
+            app._menu_toggle_mode(None, None)
+            self.assertTrue(app.config.realtime_transcription)
+            with open(Path(directory) / "GPTTranscribe" / "config.json", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        self.assertTrue(payload["realtime_transcription"])
+
     def test_realtime_session_update_uses_documented_live_model_and_context(self):
         update = build_realtime_session_update(
             Config(
@@ -115,6 +127,14 @@ class CoreTests(unittest.TestCase):
                     self.events.put(
                         json.dumps(
                             {
+                                "type": "conversation.item.input_audio_transcription.delta",
+                                "delta": "hello from ",
+                            }
+                        )
+                    )
+                    self.events.put(
+                        json.dumps(
+                            {
                                 "type": "conversation.item.input_audio_transcription.completed",
                                 "transcript": "hello from realtime",
                             }
@@ -143,8 +163,9 @@ class CoreTests(unittest.TestCase):
             WebSocketTimeoutException=FakeTimeout,
         )
         config = Config()
+        deltas = []
         with patch.dict(sys.modules, {"websocket": fake_websocket}):
-            session = RealtimeTranscriptionSession("test-key", config)
+            session = RealtimeTranscriptionSession("test-key", config, on_delta=deltas.append)
             session.start()
             pcm = b"\x01\x00" * 120
             session.append_audio(pcm, 24_000)
@@ -154,10 +175,47 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(fake_socket.headers, ["Authorization: Bearer test-key"])
         self.assertEqual(fake_socket.sent[0]["type"], "session.update")
         self.assertEqual(fake_socket.sent[0]["session"]["audio"]["input"]["transcription"]["model"], core.REALTIME_TRANSCRIPTION_MODEL)
+        self.assertEqual(deltas, ["hello from "])
         append_events = [event for event in fake_socket.sent if event["type"] == "input_audio_buffer.append"]
         self.assertTrue(append_events)
         self.assertEqual(base64.b64decode(append_events[0]["audio"]), pcm)
         self.assertEqual(fake_socket.sent[-1]["type"], "input_audio_buffer.commit")
+
+    def test_realtime_connection_uses_the_transcription_session_route(self):
+        self.assertEqual(core.REALTIME_URL, "wss://api.openai.com/v1/realtime?intent=transcription")
+        self.assertNotIn("model=", core.REALTIME_URL)
+
+    def test_live_text_inserter_appends_final_suffix_without_repeating_deltas(self):
+        with patch.object(core, "read_clipboard_text", return_value="previous"), patch.object(
+            core, "set_clipboard_text"
+        ) as set_clipboard, patch.object(core, "_send_paste_shortcut") as send_paste, patch.object(
+            core.threading, "Timer"
+        ) as timer:
+            inserter = core.LiveTextInserter(None)
+            inserter.append("hello")
+            self.assertTrue(inserter.complete("hello world"))
+
+        self.assertEqual(set_clipboard.call_args_list, [call("hello"), call(" world")])
+        self.assertEqual(send_paste.call_count, 2)
+        timer.assert_called_once()
+
+    def test_live_mode_does_not_paste_final_result_again(self):
+        class LiveSession:
+            def finish(self):
+                return "hello world"
+
+        app = App()
+        inserter = Mock()
+        inserter.complete.return_value = True
+        with patch.object(core, "paste_text") as paste:
+            app._transcribe_and_paste(
+                b"audio",
+                None,
+                realtime_session=LiveSession(),
+                live_text_inserter=inserter,
+            )
+        paste.assert_not_called()
+        inserter.complete.assert_called_once_with("hello world")
 
     def test_unlimited_recording_does_not_start_a_timer(self):
         app = App()

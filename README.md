@@ -1,13 +1,13 @@
 # GPT Transcribe
 
-GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. Realtime mode uses OpenAI's `gpt-live-transcribe` model while you speak; standard mode uses `gpt-transcribe` after recording stops. The recording stays in memory until the transcription request is sent; failed requests retain the latest WAV for retry.
+GPT Transcribe is a lightweight, cross-platform dictation utility. Press one global hotkey, speak, press it again, and the transcript is inserted into the text field that was focused when recording began. Live mode uses OpenAI's `gpt-live-transcribe` model and streams transcript deltas into that field as they arrive; standard mode uses `gpt-transcribe` and pastes one complete result after recording stops. The recording stays in memory until the transcription request is sent; failed requests retain the latest WAV for retry.
 
 The repository contains two native desktop implementations:
 
 - macOS: a Swift/AppKit menu-bar app for macOS 13 and newer.
 - Windows: a Python tray app for Windows 10 and 11.
 
-The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on macOS. Both versions support a Settings toggle for realtime transcription, optional transcription context (`Prompt`, `Keywords`, and `Languages`), an optional 5–180 second recording limit, launch at login, and clipboard-based insertion. Realtime transcription is enabled by default; turn it off to upload the completed recording with `gpt-transcribe`. Leave the limit blank or enter `0` to record until you press the hotkey again.
+The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on macOS. Both versions support a live/standard mode toggle, optional transcription context (`Prompt`, `Keywords`, and `Languages`), an optional 5–180 second recording limit, launch at login, and clipboard-based insertion. Live mode is enabled by default; turn it off to upload the completed recording with `gpt-transcribe`. Leave the limit blank or enter `0` to record until you press the hotkey again.
 
 ## macOS
 
@@ -23,7 +23,7 @@ Open the menu-bar microphone icon and choose **Settings…**. The macOS app stor
 2. Press `Control+Shift+Space` to start listening.
 3. Speak normally.
 4. Press the same hotkey to stop.
-5. The transcript is pasted into the original app.
+5. In live mode, transcript text streams into the original app while you speak. In standard mode, the full result is pasted after you stop.
 
 Open the menu-bar microphone menu to retry or delete a saved failed recording.
 
@@ -51,9 +51,9 @@ Download `GPTTranscribe-Setup.exe` from the [GitHub Releases page](https://githu
 2. Press `Ctrl+Shift+Space` to start listening.
 3. Speak normally.
 4. Press `Ctrl+Shift+Space` again to stop.
-5. The transcript is pasted into the original text box.
+5. In live mode, transcript text streams into the original text box while you speak. In standard mode, the full result is pasted after you stop.
 
-Right-click the microphone icon in the system tray for Settings, retrying or deleting a saved failed recording, the log folder, or Quit. The app prevents multiple copies from running at the same time.
+Right-click the microphone icon in the system tray for the live/standard mode toggle, Settings, retrying or deleting a saved failed recording, the log folder, or Quit. The app prevents multiple copies from running at the same time.
 
 The Windows Settings window supports the hotkey, realtime transcription toggle, prompt, keywords, language hints, maximum recording length, microphone selection, and launch at sign-in. Enter multiple languages separated by commas; enter one keyword per line. For unlimited recording, leave **Max seconds** blank or enter `0`. Settings and logs are stored under `%APPDATA%\GPTTranscribe\`; the API key is not stored there.
 
@@ -78,7 +78,7 @@ The tests are offline and do not send audio to OpenAI. The `--check` command ver
 
 ## Privacy and security
 
-- In realtime mode, 24 kHz PCM audio is streamed to OpenAI while the user listens. With realtime mode off, audio is held in memory until the user stops listening, then sent to OpenAI for transcription.
+- In live mode, 24 kHz PCM audio is streamed to OpenAI while the user listens, and returned transcript deltas are inserted into the captured target field. With live mode off, audio is held in memory until the user stops listening, then sent to OpenAI for transcription.
 - If transcription or insertion fails, the latest WAV is retained for retry at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. It is deleted after a successful retry or through **Delete saved recording** in the tray/menu-bar menu.
 - Apart from that failure-recovery file, the app does not intentionally write recordings to disk.
 - macOS stores a configured API key in Keychain; Windows reads `OPENAI_API_KEY` at runtime.

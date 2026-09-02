@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from collections.abc import Callable
 from importlib import util as importlib_util
 import json
 import logging
@@ -29,7 +30,7 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.4.0"
 FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 # Keep MODEL as the file-transcription default for callers that imported the
@@ -544,9 +545,15 @@ class PCM16Resampler:
 class RealtimeTranscriptionSession:
     """Stream microphone PCM to gpt-live-transcribe over a Realtime WebSocket."""
 
-    def __init__(self, api_key: str, config: Config) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        config: Config,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> None:
         self.api_key = api_key
         self.config = config
+        self._on_delta = on_delta
         self._websocket = None
         self._audio_queue: queue.Queue[bytes | None] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -700,8 +707,13 @@ class RealtimeTranscriptionSession:
         event_type = event.get("type")
         if event_type == "conversation.item.input_audio_transcription.delta":
             delta = event.get("delta")
-            if isinstance(delta, str):
+            if isinstance(delta, str) and delta:
                 self._transcript += delta
+                if self._on_delta is not None:
+                    try:
+                        self._on_delta(delta)
+                    except Exception as exc:
+                        self._set_error(f"Could not insert live transcript: {exc}")
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript")
             if isinstance(transcript, str):
@@ -863,9 +875,7 @@ def _restore_clipboard_if_unchanged(previous: str | None, inserted: str) -> None
         log_exception("Could not restore clipboard", exc)
 
 
-def paste_text(text: str, target_window: int | None) -> None:
-    previous = read_clipboard_text()
-    set_clipboard_text(text)
+def _send_paste_shortcut(target_window: int | None) -> None:
     if target_window and USER32.IsWindow(target_window):
         if USER32.IsIconic(target_window):
             USER32.ShowWindow(target_window, SW_RESTORE)
@@ -877,9 +887,82 @@ def paste_text(text: str, target_window: int | None) -> None:
     USER32.keybd_event(VK_V, 0, 0, 0)
     USER32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
     USER32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+
+def paste_text(text: str, target_window: int | None) -> None:
+    previous = read_clipboard_text()
+    set_clipboard_text(text)
+    _send_paste_shortcut(target_window)
     restore_timer = threading.Timer(1.0, _restore_clipboard_if_unchanged, args=(previous, text))
     restore_timer.daemon = True
     restore_timer.start()
+
+
+class LiveTextInserter:
+    """Paste each live delta into the window captured at recording start."""
+
+    def __init__(self, target_window: int | None):
+        self.target_window = target_window
+        self.previous_clipboard = read_clipboard_text()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._inserted_text = ""
+        self._last_clipboard_text: str | None = None
+
+    def _append_locked(self, text: str) -> None:
+        if not text:
+            return
+        set_clipboard_text(text)
+        _send_paste_shortcut(self.target_window)
+        # Give the target application time to consume this chunk before the
+        # clipboard is replaced by the next delta.
+        time.sleep(0.05)
+        self._inserted_text += text
+        self._last_clipboard_text = text
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Live transcript insertion is no longer active.")
+            self._append_locked(text)
+
+    def complete(self, transcript: str) -> bool:
+        """Append only the final suffix and report whether text was inserted."""
+        final_text = transcript.strip()
+        with self._lock:
+            if self._closed:
+                return bool(self._inserted_text)
+            current_text = self._inserted_text
+            if not current_text:
+                self._append_locked(final_text)
+            elif final_text.startswith(current_text):
+                self._append_locked(final_text[len(current_text) :])
+            self._closed = True
+            last_clipboard_text = self._last_clipboard_text
+            inserted = bool(self._inserted_text)
+        self._schedule_clipboard_restore(last_clipboard_text)
+        return inserted
+
+    def abort(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            last_clipboard_text = self._last_clipboard_text
+        self._schedule_clipboard_restore(last_clipboard_text)
+
+    def _schedule_clipboard_restore(self, last_clipboard_text: str | None) -> None:
+        if last_clipboard_text is None:
+            return
+        restore_timer = threading.Timer(
+            1.0,
+            _restore_clipboard_if_unchanged,
+            args=(self.previous_clipboard, last_clipboard_text),
+        )
+        restore_timer.daemon = True
+        restore_timer.start()
 
 
 def create_icon_image(recording: bool = False) -> "Image.Image":
@@ -927,6 +1010,7 @@ class App:
         self.icon = None
         self.stream = None
         self.realtime_session: RealtimeTranscriptionSession | None = None
+        self.live_text_inserter: LiveTextInserter | None = None
         self.recording_timer: threading.Timer | None = None
         self.audio_buffer = bytearray()
         self.audio_status_logged = False
@@ -946,6 +1030,11 @@ class App:
             APP_NAME,
             menu=tray.Menu(
                 tray.MenuItem(self._menu_record_label, self._menu_toggle),
+                tray.MenuItem(
+                    self._menu_mode_label,
+                    self._menu_toggle_mode,
+                    enabled=self._can_toggle_mode,
+                ),
                 tray.MenuItem(
                     self._menu_retry_label,
                     self._menu_retry,
@@ -1066,15 +1155,20 @@ class App:
                 self._set_status("Microphone unavailable", notify=True)
                 return
         realtime_session = None
+        live_text_inserter = None
         if self.config.realtime_transcription:
             try:
+                live_text_inserter = LiveTextInserter(self.target_window)
                 realtime_session = RealtimeTranscriptionSession(
                     os.environ["OPENAI_API_KEY"].strip(),
                     Config(self.config.__dict__),
+                    on_delta=live_text_inserter.append,
                 )
                 realtime_session.start()
             except Exception as exc:
                 log_exception("Could not start realtime transcription", exc)
+                if live_text_inserter:
+                    live_text_inserter.abort()
                 try:
                     stream.stop()
                     stream.close()
@@ -1093,11 +1187,14 @@ class App:
                     pass
                 if realtime_session:
                     realtime_session.cancel()
+                if live_text_inserter:
+                    live_text_inserter.abort()
                 self.state = "idle"
                 return
             self.stream = stream
             self.audio_sample_rate = int(round(float(getattr(stream, "samplerate", self.config.sample_rate))))
             self.realtime_session = realtime_session
+            self.live_text_inserter = live_text_inserter
             self.state = "recording"
             self.status = "Listening… press the hotkey to finish"
             self.icon.update_menu()
@@ -1145,6 +1242,8 @@ class App:
             target_window = self.target_window
             realtime_session = self.realtime_session
             self.realtime_session = None
+            live_text_inserter = self.live_text_inserter
+            self.live_text_inserter = None
             if self.recording_timer:
                 self.recording_timer.cancel()
                 self.recording_timer = None
@@ -1163,11 +1262,13 @@ class App:
         if len(audio_bytes) < 1_000:
             if realtime_session:
                 realtime_session.cancel()
+            if live_text_inserter:
+                live_text_inserter.abort()
             self._finish_with_status("No audio captured", notify=True)
             return
         worker = threading.Thread(
             target=self._transcribe_and_paste,
-            args=(audio_bytes, target_window, None, realtime_session),
+            args=(audio_bytes, target_window, None, realtime_session, live_text_inserter),
             name="GPTTranscribeRequest",
             daemon=True,
         )
@@ -1212,6 +1313,7 @@ class App:
         target_window: int | None,
         pending_path: Path | None = None,
         realtime_session: RealtimeTranscriptionSession | None = None,
+        live_text_inserter: LiveTextInserter | None = None,
     ) -> None:
         try:
             transcript = (
@@ -1219,11 +1321,13 @@ class App:
                 if realtime_session is not None
                 else transcribe_audio(audio_bytes, self.config)
             )
-            if not transcript:
+            inserted = live_text_inserter.complete(transcript) if live_text_inserter is not None else False
+            if not transcript and not inserted:
                 saved = self._save_for_retry(audio_bytes, target_window)
                 self._finish_with_status(self._failure_status("No speech detected", saved), notify=True)
                 return
-            paste_text(transcript, target_window)
+            if not inserted:
+                paste_text(transcript, target_window)
             removed = pending_path is None or self._remove_saved_recording(pending_path)
             self._finish_with_status(
                 "Inserted transcript" if removed else "Inserted transcript; saved recording retained",
@@ -1231,10 +1335,14 @@ class App:
             )
         except TranscriptionError as exc:
             log_exception("Transcription failed", exc)
+            if live_text_inserter is not None:
+                live_text_inserter.abort()
             saved = self._save_for_retry(audio_bytes, target_window)
             self._finish_with_status(self._failure_status(str(exc), saved), notify=True)
         except Exception as exc:
             log_exception("Could not insert transcript", exc)
+            if live_text_inserter is not None:
+                live_text_inserter.abort()
             saved = self._save_for_retry(audio_bytes, target_window)
             self._finish_with_status(self._failure_status("Could not insert transcript", saved), notify=True)
 
@@ -1293,6 +1401,22 @@ class App:
             if self.state == "transcribing":
                 return "Transcribing…"
             return f"Start listening ({self.config.hotkey})"
+
+    def _menu_mode_label(self, _item) -> str:
+        return "Mode: live-transcribe" if self.config.realtime_transcription else "Mode: transcribe"
+
+    def _can_toggle_mode(self, _item) -> bool:
+        with self.state_lock:
+            return self.state == "idle"
+
+    def _menu_toggle_mode(self, _icon, _item) -> None:
+        with self.state_lock:
+            if self.state != "idle":
+                return
+            self.config.realtime_transcription = not self.config.realtime_transcription
+            self.config.save()
+            mode = "live-transcribe" if self.config.realtime_transcription else "transcribe"
+        self._set_status(f"Mode set to {mode}", notify=True)
 
     def _menu_retry_label(self, _item) -> str:
         return "Retry failed recording"
@@ -1384,7 +1508,7 @@ class App:
             realtime_transcription = tk.BooleanVar(value=self.config.realtime_transcription)
             ttk.Checkbutton(
                 frame,
-                text="Use realtime transcription (gpt-live-transcribe)",
+                text="Use live-transcribe (stream into focused text box)",
                 variable=realtime_transcription,
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
 
@@ -1438,7 +1562,7 @@ class App:
 
             ttk.Label(
                 frame,
-                text="Realtime mode streams 24 kHz microphone audio while you listen; off uploads the completed recording. Prompt, keywords, and language hints are optional.\nThe API key is read from OPENAI_API_KEY and never saved here.",
+                text="Live mode streams 24 kHz audio and transcript text into the focused box; off uploads the completed recording. Prompt, keywords, and language hints are optional.\nThe API key is read from OPENAI_API_KEY and never saved here.",
                 foreground="#555555",
             ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 12))
 

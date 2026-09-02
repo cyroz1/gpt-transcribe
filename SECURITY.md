@@ -8,7 +8,7 @@ If a credential is ever exposed, revoke it in the OpenAI Platform and replace th
 
 ## Audio and transcript handling
 
-Recordings are retained in memory until the user stops dictation and the transcription request completes. If transcription or paste fails, the latest WAV is intentionally retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS until a successful retry or user deletion from the tray/menu-bar menu. The transcript is placed in the platform clipboard and pasted into the target application; other local processes may be able to observe clipboard contents according to normal platform behavior.
+Recordings are retained in memory until the user stops dictation and the transcription request completes. Standard-model recordings are sent after the user stops; live-model recordings are streamed over the authenticated Realtime connection while the user is listening and transcript deltas are pasted into the captured target field. If transcription or paste fails, the latest WAV is intentionally retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS until a successful retry or user deletion from the tray/menu-bar menu. The transcript is placed in the platform clipboard and pasted into the target application; other local processes may be able to observe clipboard contents according to normal platform behavior.
 
 Do not use the tool for secrets or regulated information unless the user's OpenAI account, organization policies, and data controls are appropriate for that use.
 

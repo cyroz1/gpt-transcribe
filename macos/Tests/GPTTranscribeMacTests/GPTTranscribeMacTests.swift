@@ -49,6 +49,11 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertFalse(AppConfig(realtimeTranscription: false).realtimeTranscription)
     }
 
+    func testRealtimeConnectionUsesTheTranscriptionSessionRoute() {
+        XCTAssertEqual(realtimeURL.absoluteString, "wss://api.openai.com/v1/realtime?intent=transcription")
+        XCTAssertFalse(realtimeURL.absoluteString.contains("model="))
+    }
+
     func testRealtimeSessionUpdateUsesDocumentedLiveModelAndContext() {
         let config = AppConfig(
             realtimeTranscription: true,

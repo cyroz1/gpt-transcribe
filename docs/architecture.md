@@ -14,21 +14,20 @@ Platform hotkey registration
        ▼
 Native microphone capture ──► in-memory PCM chunks
        │
-       │ settings toggle
-       ├─ realtime on ──► resample to 24 kHz ──► Realtime WebSocket
-       │                                           model=gpt-live-transcribe
-       └─ realtime off ─► hotkey pressed again / max duration reached
+       │ mode toggle
+       ├─ live-transcribe ─► resample to 24 kHz ─► Realtime WebSocket
+       │                                             intent=transcription
+       │                                             model=gpt-live-transcribe
+       │                                             │
+       │                                             ├─ deltas ─► ordered paste into captured target
+       │                                             └─ stop ─► commit / final suffix reconciliation
+       │
+       └─ transcribe ─────► stop / max duration
                               ▼
                          WAV encoder ──► HTTPS multipart request
                                            model=gpt-transcribe
-       │
-       │ transcription completed
-       ▼
-Transcript text
-       │
-       ├─► restore original target application
-       ├─► place transcript in the platform clipboard
-       └─► synthesize paste shortcut
+                                           │
+                                           └─ full result ─► clipboard / paste
 ```
 
 ## Components
@@ -47,7 +46,7 @@ When recording stops, both implementations wrap the PCM bytes in a standard mono
 
 ### Transcription request
 
-With realtime mode off, both clients send a multipart request to:
+With standard `transcribe` mode selected, both clients send a multipart request to:
 
 ```text
 POST https://api.openai.com/v1/audio/transcriptions
@@ -60,13 +59,13 @@ languages[]=<optional language code> (repeated)
 
 Optional `prompt`, `keywords[]`, and `languages[]` context settings are included when configured. The clients use the plural `languages` field and never send the legacy singular `language` field. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
 
-With realtime mode on, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, sends a `session.update` selecting `gpt-live-transcribe`, and streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`. The session uses `turn_detection: null`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented transcription delta and completed events. The same prompt, keywords, and language context settings are included in the realtime session update.
+With `live-transcribe` mode selected, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, then sends a transcription `session.update` selecting `gpt-live-transcribe`. It streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented delta and completed events. Each delta is pasted into the target captured when recording began; the final completed transcript is used only to append a missing suffix, so the final result is not pasted twice. The same prompt, keywords, and language context settings are included in the realtime session update.
 
 If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
 
 ### Target capture and paste
 
-At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. Before recording on macOS, the app preflights the Accessibility/post-event permission and opens the Accessibility settings when access is missing, avoiding an unnecessary transcription request. After transcription, each implementation restores the target, writes the transcript to its native clipboard, and sends a synthetic paste shortcut. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after Accessibility permission is granted.
+At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. Before recording on macOS, the app preflights the Accessibility/post-event permission and opens the Accessibility settings when access is missing, avoiding an unnecessary transcription request. Standard mode restores the target, writes the complete transcript to its native clipboard, and sends one synthetic paste shortcut. Live mode repeats that clipboard/paste operation for each ordered delta and restores the user's prior clipboard after the stream settles. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after Accessibility permission is granted.
 
 The previous text clipboard value is retained in memory and restored one second later only if the clipboard still contains the inserted transcript. This avoids overwriting a new copy action made by the user.
 

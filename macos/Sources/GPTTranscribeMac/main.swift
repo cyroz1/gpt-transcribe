@@ -9,7 +9,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.3.8"
+private let appVersion = "0.4.0"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
@@ -603,10 +603,12 @@ final class RealtimeTranscriptionSession {
     private var terminalResult: Result<String, Error>?
     private var completion: ((Result<String, Error>) -> Void)?
     private var resamplerInputRate: Int?
+    private let onDelta: ((String) -> Void)?
 
-    init(apiKey: String, config: AppConfig) {
+    init(apiKey: String, config: AppConfig, onDelta: ((String) -> Void)? = nil) {
         self.apiKey = apiKey
         self.config = config
+        self.onDelta = onDelta
     }
 
     func start() {
@@ -730,7 +732,10 @@ final class RealtimeTranscriptionSession {
 
         switch type {
         case "conversation.item.input_audio_transcription.delta":
-            if let delta = event["delta"] as? String { transcriptDelta += delta }
+            if let delta = event["delta"] as? String, !delta.isEmpty {
+                transcriptDelta += delta
+                onDelta?(delta)
+            }
         case "conversation.item.input_audio_transcription.completed":
             let transcript = (event["transcript"] as? String ?? transcriptDelta)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1004,6 +1009,140 @@ enum PasteError: LocalizedError {
     }
 }
 
+final class LiveTextInserter {
+    private let application: NSRunningApplication?
+    private let queue = DispatchQueue(label: "com.gpttranscribe.live-paste")
+    private var previousClipboard: String?
+    private var insertedText = ""
+    private var lastClipboardText: String?
+    private var closed = false
+    private var error: Error?
+
+    init(application: NSRunningApplication?) {
+        self.application = application
+        previousClipboard = NSPasteboard.general.string(forType: .string)
+    }
+
+    func append(_ text: String) {
+        guard !text.isEmpty else { return }
+        queue.async { [weak self] in
+            guard let self, !self.closed, self.error == nil else { return }
+            do {
+                try self.pasteChunk(text)
+                self.insertedText += text
+                self.lastClipboardText = text
+            } catch {
+                self.error = error
+                self.closed = true
+                self.scheduleClipboardRestore()
+            }
+        }
+    }
+
+    func complete(finalText: String, completion: @escaping (Result<Bool, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(.success(false)) }
+                return
+            }
+            if let error = self.error {
+                DispatchQueue.main.async { completion(.failure(error)) }
+                return
+            }
+            if self.closed {
+                DispatchQueue.main.async { completion(.success(!self.insertedText.isEmpty)) }
+                return
+            }
+
+            do {
+                let normalized = finalText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if self.insertedText.isEmpty {
+                    try self.pasteChunk(normalized)
+                    if !normalized.isEmpty {
+                        self.insertedText = normalized
+                        self.lastClipboardText = normalized
+                    }
+                } else if normalized.hasPrefix(self.insertedText) {
+                    let suffix = String(normalized.dropFirst(self.insertedText.count))
+                    try self.pasteChunk(suffix)
+                    if !suffix.isEmpty {
+                        self.insertedText += suffix
+                        self.lastClipboardText = suffix
+                    }
+                }
+                self.closed = true
+                self.scheduleClipboardRestore()
+                let inserted = !self.insertedText.isEmpty
+                DispatchQueue.main.async { completion(.success(inserted)) }
+            } catch {
+                self.error = error
+                self.closed = true
+                self.scheduleClipboardRestore()
+                DispatchQueue.main.async { completion(.failure(error)) }
+            }
+        }
+    }
+
+    func abort() {
+        queue.async { [weak self] in
+            guard let self, !self.closed else { return }
+            self.closed = true
+            self.scheduleClipboardRestore()
+        }
+    }
+
+    private func pasteChunk(_ text: String) throws {
+        guard !text.isEmpty else { return }
+        try runOnMain {
+            guard hasAccessibilityPermission() else {
+                return .failure(PasteError.accessibilityRequired)
+            }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
+                return .failure(PasteError.couldNotWriteClipboard)
+            }
+            self.application?.activate(options: [.activateIgnoringOtherApps])
+            return .success(())
+        }
+
+        Thread.sleep(forTimeInterval: 0.18)
+        try runOnMain {
+            guard hasAccessibilityPermission() else {
+                return .failure(PasteError.accessibilityRequired)
+            }
+            guard
+                let source = CGEventSource(stateID: .combinedSessionState),
+                let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+                let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+            else {
+                return .failure(PasteError.couldNotPostPaste)
+            }
+            keyDown.flags = .maskCommand
+            keyUp.flags = .maskCommand
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            return .success(())
+        }
+        Thread.sleep(forTimeInterval: 0.08)
+    }
+
+    private func runOnMain(_ work: @escaping () -> Result<Void, Error>) throws {
+        let result = DispatchQueue.main.sync(execute: work)
+        try result.get()
+    }
+
+    private func scheduleClipboardRestore() {
+        guard let lastClipboardText, let previousClipboard else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let pasteboard = NSPasteboard.general
+            guard pasteboard.string(forType: .string) == lastClipboardText else { return }
+            pasteboard.clearContents()
+            pasteboard.setString(previousClipboard, forType: .string)
+        }
+    }
+}
+
 // MARK: - Settings window
 
 final class PasteableSecureTextField: NSSecureTextField {
@@ -1047,7 +1186,7 @@ final class SettingsWindowController: NSWindowController {
 
     init(config: AppConfig, keychainKeyExists: Bool, saveHandler: @escaping (AppConfig, String) -> Void, removeKeyHandler: @escaping () -> Void) {
         self.hotkeyField = NSTextField(string: config.hotkey)
-        self.realtimeTranscriptionButton = NSButton(checkboxWithTitle: "Use realtime transcription (gpt-live-transcribe)", target: nil, action: nil)
+        self.realtimeTranscriptionButton = NSButton(checkboxWithTitle: "Use live-transcribe (stream into focused text box)", target: nil, action: nil)
         self.languagesField = NSTextField(string: config.languages.joined(separator: ", "))
         self.promptField = NSTextField(string: config.prompt)
         self.keywordsField = NSTextField(string: config.keywords.joined(separator: ", "))
@@ -1133,7 +1272,7 @@ final class SettingsWindowController: NSWindowController {
 
         stack.addArrangedSubview(launchAtLoginButton)
 
-        let note = NSTextField(labelWithString: "Realtime mode streams 24 kHz microphone audio while you listen; off uploads the completed recording. Prompt, keywords, and language hints are optional. The API key is never written to the settings file.")
+        let note = NSTextField(labelWithString: "Live mode streams 24 kHz audio and transcript text into the focused box; off uploads the completed recording. Prompt, keywords, and language hints are optional. The API key is never written to the settings file.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
         note.maximumNumberOfLines = 2
@@ -1247,6 +1386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let hotKeyManager = HotKeyManager()
     private var config = AppConfig()
     private var realtimeSession: RealtimeTranscriptionSession?
+    private var liveTextInserter: LiveTextInserter?
     private var state: State = .idle
     private var status = "Ready"
     private var statusItem: NSStatusItem!
@@ -1278,6 +1418,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingTimer = nil
         realtimeSession?.cancel()
         realtimeSession = nil
+        liveTextInserter?.abort()
+        liveTextInserter = nil
         audioRecorder.cancel()
         hotKeyManager.unregister()
         logger.info("Stopped")
@@ -1302,6 +1444,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let recordItem = NSMenuItem(title: recordMenuTitle(), action: #selector(toggleRecording), keyEquivalent: "")
         recordItem.target = self
         menu.addItem(recordItem)
+        let modeItem = NSMenuItem(title: "Mode: \(transcriptionModeTitle())", action: #selector(toggleTranscriptionMode), keyEquivalent: "")
+        modeItem.target = self
+        modeItem.isEnabled = state == .idle
+        menu.addItem(modeItem)
         let retryItem = NSMenuItem(title: "Retry failed recording", action: #selector(retryFailedRecording), keyEquivalent: "")
         retryItem.target = self
         retryItem.isEnabled = canRetry
@@ -1348,6 +1494,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func transcriptionModeTitle() -> String {
+        config.realtimeTranscription ? "live-transcribe" : "transcribe"
+    }
+
+    @objc private func toggleTranscriptionMode() {
+        guard state == .idle else { return }
+        config.realtimeTranscription.toggle()
+        config.save()
+        setStatus("Mode set to \(transcriptionModeTitle())", notify: true)
+    }
+
     @objc private func toggleRecording() {
         switch state {
         case .idle: startRecording()
@@ -1381,10 +1538,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state = .starting
         targetApplication = currentTargetApplication()
         let configSnapshot = config
+        let inserter = configSnapshot.realtimeTranscription
+            ? LiveTextInserter(application: targetApplication)
+            : nil
         let session = configSnapshot.realtimeTranscription
-            ? RealtimeTranscriptionSession(apiKey: apiKey, config: configSnapshot)
+            ? RealtimeTranscriptionSession(
+                apiKey: apiKey,
+                config: configSnapshot,
+                onDelta: { text in inserter?.append(text) }
+            )
             : nil
         realtimeSession = session
+        liveTextInserter = inserter
         session?.start()
         updateStatusItem()
         audioRecorder.start(onPCMChunk: { [weak self] pcm, sampleRate in
@@ -1408,6 +1573,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .failure(let error):
                     self.realtimeSession?.cancel()
                     self.realtimeSession = nil
+                    self.liveTextInserter?.abort()
+                    self.liveTextInserter = nil
                     self.state = .idle
                     self.setStatus(error.localizedDescription, notify: true)
                 }
@@ -1422,7 +1589,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingTimer = nil
         let recording = audioRecorder.stop()
         let activeRealtimeSession = realtimeSession
-        realtimeSession = nil
+        let activeLiveTextInserter = liveTextInserter
+        // Keep both objects strongly retained until the asynchronous finish
+        // and final paste reconciliation callbacks have completed.
         let target = targetApplication
         targetApplication = nil
         status = "Transcribing…"
@@ -1431,61 +1600,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let audio = makeWAV(pcm: recording.pcm, sampleRate: recording.sampleRate)
         guard audio.count >= 1_000 else {
             activeRealtimeSession?.cancel()
+            activeLiveTextInserter?.abort()
+            if let activeRealtimeSession, realtimeSession === activeRealtimeSession {
+                realtimeSession = nil
+            }
+            if let activeLiveTextInserter, liveTextInserter === activeLiveTextInserter {
+                liveTextInserter = nil
+            }
             finish(status: "No audio captured", notify: true)
             return
         }
-        transcribeAndPaste(audio: audio, target: target, pendingURL: nil, realtimeSession: activeRealtimeSession)
+        transcribeAndPaste(
+            audio: audio,
+            target: target,
+            pendingURL: nil,
+            realtimeSession: activeRealtimeSession,
+            liveTextInserter: activeLiveTextInserter
+        )
     }
 
     private func transcribeAndPaste(
         audio: Data,
         target: NSRunningApplication?,
         pendingURL: URL?,
-        realtimeSession: RealtimeTranscriptionSession? = nil
+        realtimeSession: RealtimeTranscriptionSession? = nil,
+        liveTextInserter: LiveTextInserter? = nil
     ) {
         guard audio.count >= 1_000 else {
             realtimeSession?.cancel()
+            liveTextInserter?.abort()
+            if let realtimeSession, self.realtimeSession === realtimeSession {
+                self.realtimeSession = nil
+            }
+            if let liveTextInserter, self.liveTextInserter === liveTextInserter {
+                self.liveTextInserter = nil
+            }
             finish(status: "No audio captured", notify: true)
             return
         }
         guard let apiKey = KeychainStore.configuredValue else {
             realtimeSession?.cancel()
+            liveTextInserter?.abort()
+            if let realtimeSession, self.realtimeSession === realtimeSession {
+                self.realtimeSession = nil
+            }
+            if let liveTextInserter, self.liveTextInserter === liveTextInserter {
+                self.liveTextInserter = nil
+            }
             let saved = saveForRetry(audio)
             finish(status: failureStatus(TranscriptionError.missingAPIKey.localizedDescription, saved: saved), notify: true)
             return
         }
         let configSnapshot = config
+        let clearLiveResources: () -> Void = { [weak self] in
+            guard let self else { return }
+            if let realtimeSession, self.realtimeSession === realtimeSession {
+                self.realtimeSession = nil
+            }
+            if let liveTextInserter, self.liveTextInserter === liveTextInserter {
+                self.liveTextInserter = nil
+            }
+        }
+        let handlePasteResult: (Result<Void, Error>) -> Void = { [weak self] pasteResult in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch pasteResult {
+                case .success:
+                    clearLiveResources()
+                    let removed: Bool
+                    if let pendingURL {
+                        removed = self.removeSavedRecording(at: pendingURL)
+                    } else {
+                        removed = true
+                    }
+                    self.finish(
+                        status: removed ? "Inserted transcript" : "Inserted transcript; saved recording retained",
+                        notify: !removed
+                    )
+                case .failure(let error):
+                    clearLiveResources()
+                    let saved = self.saveForRetry(audio)
+                    self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
+                }
+            }
+        }
         let handleResult: (Result<String, Error>) -> Void = { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {
                 case .success(let transcript) where transcript.isEmpty:
-                    let saved = self.saveForRetry(audio)
-                    self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
-                case .success(let transcript):
-                    pasteText(transcript, into: target) { [weak self] pasteResult in
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self else { return }
-                            switch pasteResult {
+                    if let liveTextInserter {
+                        liveTextInserter.complete(finalText: transcript) { result in
+                            switch result {
+                            case .success(let inserted) where inserted:
+                                handlePasteResult(.success(()))
                             case .success:
-                                let removed: Bool
-                                if let pendingURL {
-                                    removed = self.removeSavedRecording(at: pendingURL)
-                                } else {
-                                    removed = true
-                                }
-                                self.finish(
-                                    status: removed ? "Inserted transcript" : "Inserted transcript; saved recording retained",
-                                    notify: !removed
-                                )
-                            case .failure(let error):
+                                clearLiveResources()
                                 let saved = self.saveForRetry(audio)
-                                self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
+                                self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
+                            case .failure(let error):
+                                handlePasteResult(.failure(error))
                             }
                         }
+                    } else {
+                        clearLiveResources()
+                        let saved = self.saveForRetry(audio)
+                        self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
+                    }
+                case .success(let transcript):
+                    let finishTranscript: (Bool) -> Void = { inserted in
+                        if inserted {
+                            handlePasteResult(.success(()))
+                        } else {
+                            pasteText(transcript, into: target, completion: handlePasteResult)
+                        }
+                    }
+                    if let liveTextInserter {
+                        liveTextInserter.complete(finalText: transcript) { result in
+                            switch result {
+                            case .success(let inserted):
+                                finishTranscript(inserted)
+                            case .failure(let error):
+                                handlePasteResult(.failure(error))
+                            }
+                        }
+                    } else {
+                        finishTranscript(false)
                     }
                 case .failure(let error):
                     self.logger.error("Transcription failed: \(error.localizedDescription)")
+                    liveTextInserter?.abort()
+                    clearLiveResources()
                     let saved = self.saveForRetry(audio)
                     self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                 }
