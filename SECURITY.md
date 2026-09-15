@@ -17,7 +17,7 @@ Do not use the tool for secrets or regulated information unless the user's OpenA
 The app uses a global hotkey, foreground-application APIs, the clipboard, and synthetic keyboard input. Protected or elevated applications may reject focus changes or simulated paste. This is a compatibility limitation, not a bypass mechanism.
 
 - Windows installation requires administrator approval because it installs under Program Files. Launch at sign-in writes only the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` entry.
-- macOS paste insertion requires the user to grant Accessibility permission. The app uses that permission only to activate the target application and post Command-V; it does not inspect or modify protected UI contents.
+- macOS paste insertion requires the user to grant the post-event permission in Privacy & Security (called Accessibility through macOS 26 and Device Control and Data Access on macOS 27 and newer). The app uses that permission only to activate the target application and post Command-V; it does not inspect or modify protected UI contents.
 - macOS microphone capture requires the standard microphone permission declared in the app bundle. The app uses the system default input device and only persists raw audio as the user-requested failure-recovery file described above.
 
 Neither platform's launch-at-login option grants elevation or writes settings for other users.

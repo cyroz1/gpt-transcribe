@@ -13,7 +13,7 @@ The default hotkey is `Ctrl+Shift+Space` on Windows and `Control+Shift+Space` on
 
 ### Install
 
-Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. Before recording, the app checks for Accessibility access and opens **System Settings → Privacy & Security → Accessibility** when it is missing.
+Download `GPTTranscribe.dmg` from the [GitHub Releases page](https://github.com/cyroz1/gpt-transcribe/releases), open it, and copy **GPT Transcribe** to Applications. On first use, macOS asks for microphone access. Before recording, the app checks for cross-application paste access and opens **System Settings → Privacy & Security → Accessibility** when it is missing. On macOS 27 and newer, that section is named **Device Control and Data Access**.
 
 Open the menu-bar microphone icon and choose **Settings…**. The macOS app stores an API key in the macOS Keychain; it never writes the key to the settings file. It also accepts `OPENAI_API_KEY` from the process environment, which is useful for development. If `Command+V` is unavailable in the secure field, use the field's **Paste** button.
 
@@ -92,7 +92,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the component and data-fl
 
 ### The hotkey does nothing
 
-Another application may already own the hotkey. Open Settings, choose another combination, save, and try again. On macOS, global registration does not require Accessibility permission; Accessibility is needed for the final paste step.
+Another application may already own the hotkey. Open Settings, choose another combination, save, and try again. On macOS, global registration does not require the cross-application paste permission; that permission is needed for the final paste step.
 
 ### The microphone is unavailable
 
@@ -104,7 +104,7 @@ Confirm the key is a valid OpenAI Platform API key. The macOS app reads the Keyc
 
 ### Text is not inserted
 
-Try a normal text editor first. On macOS, grant Accessibility access to GPT Transcribe when prompted. If the app was rebuilt or moved, remove the old GPT Transcribe entry and add the current app again, then retry. On Windows, make sure the target window accepts `Ctrl+V`; applications running as administrator may reject input from a non-elevated tray app.
+Try a normal text editor first. On macOS, grant GPT Transcribe access in **Privacy & Security → Accessibility** (called **Device Control and Data Access** on macOS 27 and newer) when prompted. If the app was rebuilt or moved, remove the old GPT Transcribe entry and add the current app again, then retry. On Windows, make sure the target window accepts `Ctrl+V`; applications running as administrator may reject input from a non-elevated tray app.
 
 ## Project layout
 

@@ -54,6 +54,26 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertFalse(realtimeURL.absoluteString.contains("model="))
     }
 
+    func testPastePermissionNameMatchesTheMacOS27SettingsLabel() {
+        let olderVersion = OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
+        let currentVersion = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
+
+        XCTAssertEqual(pastePermissionSettingsName(for: olderVersion), "Accessibility")
+        XCTAssertEqual(pastePermissionSettingsName(for: currentVersion), "Device Control and Data Access")
+        XCTAssertEqual(
+            pastePermissionSettingsLocation(for: currentVersion),
+            "System Settings → Privacy & Security → Device Control and Data Access"
+        )
+    }
+
+    func testPastePermissionUsesModernPrivacySecurityDeepLinkOnSupportedMacOS() {
+        let version = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
+        XCTAssertEqual(
+            accessibilitySettingsURL(for: version).absoluteString,
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"
+        )
+    }
+
     func testRealtimeSessionUpdateUsesDocumentedLiveModelAndContext() {
         let config = AppConfig(
             realtimeTranscription: true,

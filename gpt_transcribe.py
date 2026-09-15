@@ -30,7 +30,7 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 # Keep MODEL as the file-transcription default for callers that imported the

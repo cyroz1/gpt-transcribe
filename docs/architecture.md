@@ -65,7 +65,7 @@ If transcription or paste fails, the latest WAV is atomically retained at `%APPD
 
 ### Target capture and paste
 
-At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. Before recording on macOS, the app preflights the Accessibility/post-event permission and opens the Accessibility settings when access is missing, avoiding an unnecessary transcription request. Standard mode restores the target, writes the complete transcript to its native clipboard, and sends one synthetic paste shortcut. Live mode repeats that clipboard/paste operation for each ordered delta and restores the user's prior clipboard after the stream settles. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after Accessibility permission is granted.
+At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. Before recording on macOS, the app preflights the post-event permission required for paste and opens the current Privacy & Security destination when access is missing, avoiding an unnecessary transcription request. That destination is labeled **Accessibility** through macOS 26 and **Device Control and Data Access** on macOS 27 and newer. Standard mode restores the target, writes the complete transcript to its native clipboard, and sends one synthetic paste shortcut. Live mode repeats that clipboard/paste operation for each ordered delta and restores the user's prior clipboard after the stream settles. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after post-event permission is granted.
 
 The previous text clipboard value is retained in memory and restored one second later only if the clipboard still contains the inserted transcript. This avoids overwriting a new copy action made by the user.
 
@@ -105,4 +105,4 @@ The transcription worker runs separately from the tray/menu-bar and audio thread
 | Launch-at-login command | Per-user startup registration | Windows Run value; macOS `SMAppService` |
 | Logs | Persistent local text | Platform application-support directory, `app.log` |
 
-The application has no local server, database, cloud storage, or background upload queue. It requires the user's desktop session and microphone permission. macOS also requires Accessibility permission for cross-application paste.
+The application has no local server, database, cloud storage, or background upload queue. It requires the user's desktop session and microphone permission. macOS also requires the cross-application paste permission, labeled Accessibility through macOS 26 and Device Control and Data Access on macOS 27 and newer.

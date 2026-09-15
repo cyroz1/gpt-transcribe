@@ -3,13 +3,12 @@ import AVFoundation
 import Carbon
 import CoreGraphics
 import Foundation
-import ApplicationServices
 import ServiceManagement
 import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.4.0"
+private let appVersion = "0.4.1"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
@@ -926,19 +925,32 @@ final class TranscriptionClient {
 
 // MARK: - Launch at login and paste integration
 
-private let accessibilitySettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+private let legacyAccessibilitySettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+private let modernAccessibilitySettingsURL = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility")!
+private let macOS27MajorVersion = 27
+
+func pastePermissionSettingsName(for version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion) -> String {
+    version.majorVersion >= macOS27MajorVersion ? "Device Control and Data Access" : "Accessibility"
+}
+
+func pastePermissionSettingsLocation(for version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion) -> String {
+    "System Settings → Privacy & Security → \(pastePermissionSettingsName(for: version))"
+}
+
+func accessibilitySettingsURL(for version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion) -> URL {
+    version.majorVersion >= 13 ? modernAccessibilitySettingsURL : legacyAccessibilitySettingsURL
+}
 
 func hasAccessibilityPermission() -> Bool {
-    // macOS versions expose this authorization through two related checks.
-    // The Accessibility list shown in System Settings is reflected by AX,
-    // while CGEvent preflight can be more specific on older releases.
-    AXIsProcessTrusted() || CGPreflightPostEventAccess()
+    // This is the permission required by the actual insertion operation below.
+    return CGPreflightPostEventAccess()
 }
 
 func requestAccessibilityPermission() {
-    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-    _ = AXIsProcessTrustedWithOptions(options)
-    NSWorkspace.shared.open(accessibilitySettingsURL)
+    // Request event-synthesis access so macOS can register the app in the
+    // current Privacy & Security pane before we take the user there.
+    _ = CGRequestPostEventAccess()
+    _ = NSWorkspace.shared.open(accessibilitySettingsURL())
 }
 
 enum LaunchAtLogin {
@@ -1004,7 +1016,7 @@ enum PasteError: LocalizedError {
         case .couldNotPostPaste:
             return "Could not create the macOS paste event."
         case .accessibilityRequired:
-            return "Allow GPT Transcribe in System Settings → Privacy & Security → Accessibility to paste into other apps."
+            return "Allow GPT Transcribe in \(pastePermissionSettingsLocation()) to paste into other apps."
         }
     }
 }
@@ -1279,7 +1291,7 @@ final class SettingsWindowController: NSWindowController {
         note.preferredMaxLayoutWidth = 465
         stack.addArrangedSubview(note)
 
-        let accessibilityButton = NSButton(title: "Open Accessibility Settings", target: self, action: #selector(openAccessibilitySettings))
+        let accessibilityButton = NSButton(title: "Open \(pastePermissionSettingsName())", target: self, action: #selector(openAccessibilitySettings))
         accessibilityButton.bezelStyle = .rounded
         stack.addArrangedSubview(accessibilityButton)
 
@@ -1333,7 +1345,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func openAccessibilitySettings() {
-        NSWorkspace.shared.open(accessibilitySettingsURL)
+        _ = NSWorkspace.shared.open(accessibilitySettingsURL())
     }
 
     @objc private func saveClicked() {
@@ -1523,6 +1535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return false
         }
+        accessibilitySettingsOpened = false
         return true
     }
 
