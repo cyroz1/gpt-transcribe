@@ -50,6 +50,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: GPT Transcribe ${{ github.ref_name }}
+          # Keep release-note generation in exactly one platform workflow.
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: dist/installer/GPTTranscribe-Setup.exe
