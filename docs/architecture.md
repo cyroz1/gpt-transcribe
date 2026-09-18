@@ -59,7 +59,7 @@ languages[]=<optional language code> (repeated)
 
 Optional `prompt`, `keywords[]`, and `languages[]` context settings are included when configured. The clients use the plural `languages` field and never send the legacy singular `language` field. Windows reads the API key from `OPENAI_API_KEY`. macOS checks that environment variable first and otherwise reads the value saved in the macOS Keychain. Error handling converts invalid-key responses into a generic message so credential fragments are not echoed into the UI.
 
-With `live-transcribe` mode selected, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, then sends a transcription `session.update` selecting `gpt-live-transcribe`. It streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented delta and completed events. Each delta is pasted into the target captured when recording began; the final completed transcript is used only to append a missing suffix, so the final result is not pasted twice. The same prompt, keywords, and language context settings are included in the realtime session update.
+With `live-transcribe` mode selected, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, then sends a transcription `session.update` selecting `gpt-live-transcribe`. It streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented delta and completed events. Each delta is pasted into the target captured when recording began; the final completed transcript is used only to append a missing suffix, so the final result is not pasted twice. If the final transcript revises already-pasted text, the app reports the reconciliation failure and preserves the WAV for retry instead of silently claiming success with incorrect text. The same prompt, keywords, and language context settings are included in the realtime session update.
 
 If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
 
@@ -91,7 +91,7 @@ idle ──start──► starting ──stream ready──► recording
   └────────────── finished ◄──── transcribing
 ```
 
-The transcription worker runs separately from the tray/menu-bar and audio threads so the UI remains responsive while the network request is in progress. A new recording is ignored until the current transcription completes.
+The transcription worker runs separately from the tray/menu-bar and audio threads so the UI remains responsive while audio encoding and the network request are in progress. A new recording is ignored until the current transcription completes.
 
 ## Trust and data boundaries
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from array import array
 from collections.abc import Callable
 from importlib import util as importlib_util
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import re
 import sys
 import threading
 import time
@@ -30,7 +32,7 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 # Keep MODEL as the file-transcription default for callers that imported the
@@ -44,6 +46,9 @@ DEFAULT_SAMPLE_RATE = 16_000
 DEFAULT_MAX_RECORDING_SECONDS = 90
 DEFAULT_REALTIME_TRANSCRIPTION = True
 REALTIME_COMPLETION_TIMEOUT = 30
+REALTIME_AUDIO_QUEUE_MAXSIZE = 128
+REALTIME_DELTA_BATCH_INTERVAL = 0.1
+MAX_TRANSCRIPTION_PROMPT_CHARACTERS = 4_000
 MIN_MAX_RECORDING_SECONDS = 5
 MAX_MAX_RECORDING_SECONDS = 180
 FAILED_RECORDING_FILENAME = "failed-recording.wav"
@@ -52,6 +57,7 @@ STARTUP_VALUE_NAME = "GPTTranscribe"
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_APP_APPLY_HOTKEY = 0x8001
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -65,6 +71,7 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 SW_RESTORE = 9
 ERROR_ALREADY_EXISTS = 183
+HOTKEY_ID = 1
 
 
 USER32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -271,6 +278,10 @@ class TranscriptionError(RuntimeError):
     pass
 
 
+class LiveTextReconciliationError(TranscriptionError):
+    """The final transcript revised text that was already pasted live."""
+
+
 def parse_setting_list(value: object) -> list[str]:
     """Normalize comma- or newline-separated transcription settings."""
     if isinstance(value, (list, tuple)):
@@ -278,6 +289,37 @@ def parse_setting_list(value: object) -> list[str]:
     else:
         values = str(value or "").replace(",", "\n").splitlines()
     return [str(item).strip() for item in values if str(item).strip()]
+
+
+def parse_max_recording_seconds(value: object) -> int:
+    """Parse the settings field while preserving 0 as unlimited."""
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return 0
+    try:
+        number = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Max seconds must be blank, 0, or a whole number from {MIN_MAX_RECORDING_SECONDS} to {MAX_MAX_RECORDING_SECONDS}."
+        ) from exc
+    if number == 0:
+        return 0
+    return max(MIN_MAX_RECORDING_SECONDS, min(MAX_MAX_RECORDING_SECONDS, number))
+
+
+def validate_transcription_settings(prompt: str, keywords: list[str], languages: list[str]) -> None:
+    """Reject context values that the transcription APIs cannot accept."""
+    if len(prompt) > MAX_TRANSCRIPTION_PROMPT_CHARACTERS:
+        raise ValueError(
+            f"Prompt is too long. Keep it under {MAX_TRANSCRIPTION_PROMPT_CHARACTERS} characters."
+        )
+    for keyword in keywords:
+        if any(character in keyword for character in "<>\r\n"):
+            raise ValueError("Keywords cannot contain <, >, or line breaks.")
+    for language in languages:
+        normalized = language.lower()
+        if not re.fullmatch(r"[a-z]{2,3}", normalized) and normalized not in {"zh-cn", "zh-tw", "zh-hk"}:
+            raise ValueError(f"Unsupported language code format: {language}")
 
 
 class Config:
@@ -293,7 +335,7 @@ class Config:
         languages = values.get("languages")
         if languages is None:
             languages = values.get("language", "")
-        self.languages = parse_setting_list(languages)
+        self.languages = [item.lower() for item in parse_setting_list(languages)]
         self.max_recording_seconds = self._normalize_max_recording_seconds(
             values.get("max_recording_seconds", DEFAULT_MAX_RECORDING_SECONDS)
         )
@@ -313,7 +355,7 @@ class Config:
 
     @language.setter
     def language(self, value: object) -> None:
-        self.languages = parse_setting_list(value)
+        self.languages = [item.lower() for item in parse_setting_list(value)]
 
     @staticmethod
     def _as_bool(value: object) -> bool:
@@ -342,6 +384,9 @@ class Config:
         if number == 0:
             return 0
         return max(MIN_MAX_RECORDING_SECONDS, min(MAX_MAX_RECORDING_SECONDS, number))
+
+    def validate(self) -> None:
+        validate_transcription_settings(self.prompt, self.keywords, self.languages)
 
     @classmethod
     def load(cls) -> "Config":
@@ -378,6 +423,7 @@ class Config:
 
 
 def build_realtime_session_update(config: Config) -> dict[str, object]:
+    config.validate()
     transcription: dict[str, object] = {
         "model": REALTIME_TRANSCRIPTION_MODEL,
         "delay": "low",
@@ -519,27 +565,50 @@ def _api_error_message(response_bytes: bytes, status: int) -> str:
 
 
 class PCM16Resampler:
-    """Convert mono little-endian PCM16 chunks to the Realtime sample rate."""
+    """Convert mono little-endian PCM16 chunks to the Realtime sample rate.
+
+    This is a small streaming linear-interpolation resampler. It deliberately
+    uses only the standard library because ``audioop`` was removed from Python
+    3.13 and live mode must continue to work on current Python releases.
+    """
 
     def __init__(self, input_rate: int, output_rate: int = REALTIME_SAMPLE_RATE) -> None:
         self.input_rate = int(input_rate)
         self.output_rate = int(output_rate)
-        self._rate_state = None
+        self._pending_samples: list[float] = []
+        self._position = 0.0
 
     def convert(self, pcm_bytes: bytes) -> bytes:
         if self.input_rate == self.output_rate:
             return pcm_bytes
-        import audioop
+        sample_bytes = len(pcm_bytes) - (len(pcm_bytes) % 2)
+        if sample_bytes == 0:
+            return b""
+        input_samples = array("h")
+        input_samples.frombytes(pcm_bytes[:sample_bytes])
+        if sys.byteorder != "little":
+            input_samples.byteswap()
+        self._pending_samples.extend(sample / 32768.0 for sample in input_samples)
 
-        converted, self._rate_state = audioop.ratecv(
-            pcm_bytes,
-            2,
-            1,
-            self.input_rate,
-            self.output_rate,
-            self._rate_state,
-        )
-        return converted
+        step = self.input_rate / self.output_rate
+        output_samples = array("h")
+        while self._position + 1 < len(self._pending_samples):
+            index = int(self._position)
+            fraction = self._position - index
+            sample = self._pending_samples[index]
+            sample += (self._pending_samples[index + 1] - sample) * fraction
+            sample = max(-1.0, min(1.0, sample))
+            output_samples.append(int(sample * (32768 if sample < 0 else 32767)))
+            self._position += step
+
+        consumed = int(self._position)
+        if consumed:
+            del self._pending_samples[:consumed]
+            self._position -= consumed
+
+        if sys.byteorder != "little":
+            output_samples.byteswap()
+        return output_samples.tobytes()
 
 
 class RealtimeTranscriptionSession:
@@ -555,7 +624,7 @@ class RealtimeTranscriptionSession:
         self.config = config
         self._on_delta = on_delta
         self._websocket = None
-        self._audio_queue: queue.Queue[bytes | None] = queue.Queue()
+        self._audio_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=REALTIME_AUDIO_QUEUE_MAXSIZE)
         self._thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -569,6 +638,11 @@ class RealtimeTranscriptionSession:
         self._resampler_lock = threading.Lock()
         self._socket = None
         self._socket_lock = threading.Lock()
+        self._delta_lock = threading.Lock()
+        self._delta_delivery_lock = threading.Lock()
+        self._pending_delta = ""
+        self._delta_timer: threading.Timer | None = None
+        self._item_id: str | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -588,7 +662,7 @@ class RealtimeTranscriptionSession:
         self._thread.start()
 
     def append_audio(self, pcm_bytes: bytes | bytearray | memoryview, sample_rate: int) -> None:
-        if self._stop_event.is_set() or self._cancelled.is_set():
+        if self._stop_event.is_set() or self._cancelled.is_set() or self._error_event.is_set():
             return
         try:
             with self._resampler_lock:
@@ -596,7 +670,9 @@ class RealtimeTranscriptionSession:
                     self._resampler = PCM16Resampler(int(sample_rate))
                 converted = self._resampler.convert(bytes(pcm_bytes))
             if converted:
-                self._audio_queue.put(converted)
+                self._audio_queue.put_nowait(converted)
+        except queue.Full:
+            self._set_error("Realtime audio could not keep up with the microphone.")
         except Exception as exc:  # pragma: no cover - audio/runtime-specific
             self._set_error(f"Could not prepare realtime audio: {exc}")
 
@@ -604,7 +680,7 @@ class RealtimeTranscriptionSession:
         if self._thread is None:
             raise TranscriptionError("Realtime transcription did not start.")
         self._stop_event.set()
-        self._audio_queue.put(None)
+        self._signal_audio_stop()
         self._thread.join(timeout=REALTIME_COMPLETION_TIMEOUT + 15)
         if self._thread.is_alive():
             self.cancel()
@@ -618,7 +694,7 @@ class RealtimeTranscriptionSession:
     def cancel(self) -> None:
         self._cancelled.set()
         self._stop_event.set()
-        self._audio_queue.put(None)
+        self._signal_audio_stop()
         self._close_socket()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
@@ -650,6 +726,8 @@ class RealtimeTranscriptionSession:
                 try:
                     item = self._audio_queue.get(timeout=0.1)
                 except queue.Empty:
+                    if self._stop_event.is_set():
+                        break
                     continue
                 if item is None:
                     break
@@ -705,16 +783,19 @@ class RealtimeTranscriptionSession:
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
+        event_item_id = event.get("item_id")
+        if isinstance(event_item_id, str):
+            if self._item_id is None:
+                self._item_id = event_item_id
+            elif self._item_id != event_item_id:
+                return
         if event_type == "conversation.item.input_audio_transcription.delta":
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 self._transcript += delta
-                if self._on_delta is not None:
-                    try:
-                        self._on_delta(delta)
-                    except Exception as exc:
-                        self._set_error(f"Could not insert live transcript: {exc}")
+                self._queue_delta(delta)
         elif event_type == "conversation.item.input_audio_transcription.completed":
+            self._flush_pending_delta()
             transcript = event.get("transcript")
             if isinstance(transcript, str):
                 self._transcript = transcript
@@ -735,6 +816,39 @@ class RealtimeTranscriptionSession:
         if self._error is None:
             self._error = TranscriptionError(message[:400])
         self._error_event.set()
+        self._stop_event.set()
+        self._signal_audio_stop()
+
+    def _queue_delta(self, delta: str) -> None:
+        with self._delta_lock:
+            self._pending_delta += delta
+            if self._delta_timer is not None:
+                return
+            self._delta_timer = threading.Timer(REALTIME_DELTA_BATCH_INTERVAL, self._flush_pending_delta)
+            self._delta_timer.daemon = True
+            self._delta_timer.start()
+
+    def _flush_pending_delta(self) -> None:
+        with self._delta_delivery_lock:
+            with self._delta_lock:
+                timer = self._delta_timer
+                self._delta_timer = None
+                pending = self._pending_delta
+                self._pending_delta = ""
+            if timer is not None and timer is not threading.current_thread():
+                timer.cancel()
+            if not pending or self._on_delta is None or self._error_event.is_set():
+                return
+            try:
+                self._on_delta(pending)
+            except Exception as exc:
+                self._set_error(f"Could not insert live transcript: {exc}")
+
+    def _signal_audio_stop(self) -> None:
+        try:
+            self._audio_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     @staticmethod
     def _connection_error_message(exc: BaseException) -> str:
@@ -765,6 +879,10 @@ def transcribe_audio(audio_bytes: bytes, config: Config) -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise TranscriptionError("OPENAI_API_KEY is not available to this app.")
+    try:
+        config.validate()
+    except ValueError as exc:
+        raise TranscriptionError(str(exc)) from exc
     fields: dict[str, str | list[str]] = {"model": FILE_TRANSCRIPTION_MODEL, "response_format": "json"}
     if config.prompt:
         fields["prompt"] = config.prompt
@@ -931,6 +1049,7 @@ class LiveTextInserter:
     def complete(self, transcript: str) -> bool:
         """Append only the final suffix and report whether text was inserted."""
         final_text = transcript.strip()
+        reconciliation_error = None
         with self._lock:
             if self._closed:
                 return bool(self._inserted_text)
@@ -939,10 +1058,16 @@ class LiveTextInserter:
                 self._append_locked(final_text)
             elif final_text.startswith(current_text):
                 self._append_locked(final_text[len(current_text) :])
+            else:
+                reconciliation_error = LiveTextReconciliationError(
+                    "Live transcription revised earlier text; partial text was left in place."
+                )
             self._closed = True
             last_clipboard_text = self._last_clipboard_text
             inserted = bool(self._inserted_text)
         self._schedule_clipboard_restore(last_clipboard_text)
+        if reconciliation_error is not None:
+            raise reconciliation_error
         return inserted
 
     def abort(self) -> None:
@@ -1007,6 +1132,7 @@ class App:
         self.stop_event = threading.Event()
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
+        self.registered_hotkey: str | None = None
         self.icon = None
         self.stream = None
         self.realtime_session: RealtimeTranscriptionSession | None = None
@@ -1015,6 +1141,7 @@ class App:
         self.audio_buffer = bytearray()
         self.audio_status_logged = False
         self.audio_sample_rate = self.config.sample_rate
+        self.recording_config: Config | None = None
         self.target_window: int | None = None
         saved_recording = failed_recording_path()
         self.pending_audio_path: Path | None = saved_recording if saved_recording.is_file() else None
@@ -1067,17 +1194,13 @@ class App:
             self.hotkey_thread.join(timeout=1.5)
 
     def _hotkey_loop(self) -> None:
+        # Create the thread message queue before another thread posts a
+        # settings-refresh message to it.
+        ctypes.windll.user32.PeekMessageW(None, None, 0, 0, 0)
         self.hotkey_thread_id = KERNEL32.GetCurrentThreadId()
-        try:
-            modifiers, virtual_key = parse_hotkey(self.config.hotkey)
-        except ValueError as exc:
-            self._set_status(f"Invalid hotkey: {exc}", notify=True)
-            return
-        if not USER32.RegisterHotKey(None, 1, modifiers, virtual_key):
-            self._set_status(
-                f"Hotkey unavailable: {self.config.hotkey}. Change it in Settings.",
-                notify=True,
-            )
+        with self.state_lock:
+            configured_hotkey = self.config.hotkey
+        if not self._register_hotkey_on_thread(configured_hotkey):
             return
         try:
             message = MSG()
@@ -1085,10 +1208,42 @@ class App:
                 result = ctypes.windll.user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result <= 0:
                     break
-                if message.message == WM_HOTKEY and message.wParam == 1:
+                if message.message == WM_HOTKEY and message.wParam == HOTKEY_ID:
                     self.toggle_recording()
+                elif message.message == WM_APP_APPLY_HOTKEY:
+                    with self.state_lock:
+                        requested_hotkey = self.config.hotkey
+                    previous_hotkey = self.registered_hotkey
+                    if requested_hotkey == previous_hotkey:
+                        continue
+                    if previous_hotkey is not None:
+                        USER32.UnregisterHotKey(None, HOTKEY_ID)
+                        self.registered_hotkey = None
+                    if not self._register_hotkey_on_thread(requested_hotkey) and previous_hotkey:
+                        self._register_hotkey_on_thread(previous_hotkey)
         finally:
-            USER32.UnregisterHotKey(None, 1)
+            USER32.UnregisterHotKey(None, HOTKEY_ID)
+            self.registered_hotkey = None
+
+    def _register_hotkey_on_thread(self, value: str) -> bool:
+        try:
+            modifiers, virtual_key = parse_hotkey(value)
+        except ValueError as exc:
+            self._set_status(f"Invalid hotkey: {exc}", notify=True)
+            return False
+        if not USER32.RegisterHotKey(None, HOTKEY_ID, modifiers, virtual_key):
+            self._set_status(
+                f"Hotkey unavailable: {value}. Change it in Settings.",
+                notify=True,
+            )
+            return False
+        self.registered_hotkey = value
+        return True
+
+    def _request_hotkey_refresh(self) -> None:
+        thread_id = self.hotkey_thread_id
+        if thread_id and not USER32.PostThreadMessageW(thread_id, WM_APP_APPLY_HOTKEY, 0, 0):
+            self._set_status("Hotkey changed; restart GPT Transcribe to apply it.", notify=True)
 
     def toggle_recording(self) -> None:
         with self.state_lock:
@@ -1104,6 +1259,11 @@ class App:
         if not os.environ.get("OPENAI_API_KEY", "").strip():
             self._set_status("Missing OPENAI_API_KEY", notify=True)
             return
+        try:
+            self.config.validate()
+        except ValueError as exc:
+            self._set_status(str(exc), notify=True)
+            return
         if self.config.realtime_transcription and not _module_available("websocket"):
             self._set_status(
                 "Realtime transcription is unavailable. Install websocket-client or turn it off in Settings.",
@@ -1118,6 +1278,7 @@ class App:
             self.audio_status_logged = False
             self.target_window = int(USER32.GetForegroundWindow() or 0) or None
             self.audio_sample_rate = self.config.sample_rate
+            self.recording_config = Config(self.config.__dict__)
         try:
             sounddevice = _load_sounddevice()
         except RuntimeError as exc:
@@ -1240,6 +1401,8 @@ class App:
             self.audio_buffer = bytearray()
             sample_rate = self.audio_sample_rate
             target_window = self.target_window
+            recording_config = self.recording_config or Config(self.config.__dict__)
+            self.recording_config = None
             realtime_session = self.realtime_session
             self.realtime_session = None
             live_text_inserter = self.live_text_inserter
@@ -1257,8 +1420,36 @@ class App:
                 stream.close()
         except Exception as exc:
             log_exception("Could not close microphone stream", exc)
-        audio_bytes = make_wav(pcm_buffer, sample_rate)
-        del pcm_buffer
+        worker = threading.Thread(
+            target=self._prepare_recording_and_transcribe,
+            args=(pcm_buffer, sample_rate, target_window, recording_config, realtime_session, live_text_inserter),
+            name="GPTTranscribeRequest",
+            daemon=True,
+        )
+        worker.start()
+        self._beep(660)
+
+    def _prepare_recording_and_transcribe(
+        self,
+        pcm_buffer: bytearray,
+        sample_rate: int,
+        target_window: int | None,
+        config: Config,
+        realtime_session: RealtimeTranscriptionSession | None,
+        live_text_inserter: LiveTextInserter | None,
+    ) -> None:
+        try:
+            audio_bytes = make_wav(pcm_buffer, sample_rate)
+        except Exception as exc:
+            log_exception("Could not prepare recording", exc)
+            if realtime_session:
+                realtime_session.cancel()
+            if live_text_inserter:
+                live_text_inserter.abort()
+            self._finish_with_status("Could not prepare recording", notify=True)
+            return
+        finally:
+            del pcm_buffer
         if len(audio_bytes) < 1_000:
             if realtime_session:
                 realtime_session.cancel()
@@ -1266,14 +1457,14 @@ class App:
                 live_text_inserter.abort()
             self._finish_with_status("No audio captured", notify=True)
             return
-        worker = threading.Thread(
-            target=self._transcribe_and_paste,
-            args=(audio_bytes, target_window, None, realtime_session, live_text_inserter),
-            name="GPTTranscribeRequest",
-            daemon=True,
+        self._transcribe_and_paste(
+            audio_bytes,
+            target_window,
+            None,
+            realtime_session,
+            live_text_inserter,
+            config,
         )
-        worker.start()
-        self._beep(660)
 
     def _save_for_retry(self, audio_bytes: bytes, target_window: int | None) -> bool:
         try:
@@ -1314,12 +1505,13 @@ class App:
         pending_path: Path | None = None,
         realtime_session: RealtimeTranscriptionSession | None = None,
         live_text_inserter: LiveTextInserter | None = None,
+        config: Config | None = None,
     ) -> None:
         try:
             transcript = (
                 realtime_session.finish()
                 if realtime_session is not None
-                else transcribe_audio(audio_bytes, self.config)
+                else transcribe_audio(audio_bytes, config or self.config)
             )
             inserted = live_text_inserter.complete(transcript) if live_text_inserter is not None else False
             if not transcript and not inserted:
@@ -1474,6 +1666,11 @@ class App:
             self._set_status("Saved recording deleted", notify=True)
 
     def _menu_quit(self, icon, _item) -> None:
+        with self.state_lock:
+            current_state = self.state
+        if current_state != "idle":
+            self._notify(APP_NAME, "Please wait for the current dictation to finish before quitting.")
+            return
         icon.stop()
 
     def _menu_open_log_folder(self, _icon, _item) -> None:
@@ -1483,6 +1680,10 @@ class App:
             log_exception("Could not open log folder", exc)
 
     def _menu_settings(self, _icon, _item) -> None:
+        with self.state_lock:
+            if self.state != "idle":
+                self._notify(APP_NAME, "Finish the current dictation before changing settings.")
+                return
         threading.Thread(target=self._settings_window, name="GPTTranscribeSettings", daemon=True).start()
 
     def _settings_window(self) -> None:
@@ -1575,34 +1776,54 @@ class App:
                 except ValueError as exc:
                     messagebox.showerror("Invalid settings", str(exc), parent=root)
                     return
-                raw_seconds = max_seconds.get().strip()
                 try:
-                    seconds = 0 if not raw_seconds else max(
-                        MIN_MAX_RECORDING_SECONDS,
-                        min(MAX_MAX_RECORDING_SECONDS, int(raw_seconds)),
+                    seconds = parse_max_recording_seconds(max_seconds.get())
+                    selected_device = device_ids[device_labels.index(device.get())]
+                    with self.state_lock:
+                        if self.state != "idle":
+                            messagebox.showerror(
+                                "Settings unavailable",
+                                "Finish the current dictation before saving settings.",
+                                parent=root,
+                            )
+                            return
+                        previous_config = Config(self.config.__dict__)
+                    candidate = Config(
+                        {
+                            "launch_on_login": bool(launch_on_login.get()),
+                            "hotkey": hotkey.get(),
+                            "realtime_transcription": bool(realtime_transcription.get()),
+                            "languages": languages.get(),
+                            "prompt": prompt.get("1.0", "end-1c"),
+                            "keywords": keywords.get("1.0", "end-1c"),
+                            "max_recording_seconds": seconds,
+                            "sample_rate": previous_config.sample_rate,
+                            "audio_device": selected_device,
+                        }
                     )
-                except ValueError:
-                    messagebox.showerror(
-                        "Invalid settings",
-                        f"Max seconds must be blank, 0, or a whole number from {MIN_MAX_RECORDING_SECONDS} to {MAX_MAX_RECORDING_SECONDS}.",
-                        parent=root,
-                    )
+                    candidate.validate()
+                except ValueError as exc:
+                    messagebox.showerror("Invalid settings", str(exc), parent=root)
                     return
-                self.config.hotkey = hotkey.get().strip().lower()
-                self.config.realtime_transcription = bool(realtime_transcription.get())
-                self.config.languages = parse_setting_list(languages.get())
-                self.config.prompt = prompt.get("1.0", "end-1c").strip()
-                self.config.keywords = parse_setting_list(keywords.get("1.0", "end-1c"))
-                self.config.max_recording_seconds = seconds
-                self.config.audio_device = device_ids[device_labels.index(device.get())]
                 try:
-                    set_launch_on_login(bool(launch_on_login.get()))
+                    if candidate.launch_on_login != previous_config.launch_on_login:
+                        set_launch_on_login(candidate.launch_on_login)
+                    candidate.save()
+                    with self.state_lock:
+                        self.config = candidate
+                    if candidate.hotkey != previous_config.hotkey:
+                        self._request_hotkey_refresh()
                 except Exception as exc:
+                    with self.state_lock:
+                        self.config = previous_config
+                    if candidate.launch_on_login != previous_config.launch_on_login:
+                        try:
+                            set_launch_on_login(previous_config.launch_on_login)
+                        except Exception as rollback_error:
+                            log_exception("Could not roll back launch-on-login setting", rollback_error)
                     log_exception("Could not update launch-on-login setting", exc)
-                    messagebox.showerror("Launch on login", str(exc), parent=root)
+                    messagebox.showerror("Could not save settings", str(exc), parent=root)
                     return
-                self.config.launch_on_login = bool(launch_on_login.get())
-                self.config.save()
                 self._notify(APP_NAME, "Settings saved. Launch on login applies at your next sign-in.")
                 root.destroy()
 

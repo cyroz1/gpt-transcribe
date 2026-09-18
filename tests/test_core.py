@@ -17,12 +17,16 @@ import gpt_transcribe as core  # noqa: E402
 from gpt_transcribe import (  # noqa: E402
     App,
     Config,
+    LiveTextReconciliationError,
+    PCM16Resampler,
     RealtimeTranscriptionSession,
     build_multipart,
     build_realtime_session_update,
     make_wav,
+    parse_max_recording_seconds,
     parse_hotkey,
     startup_command,
+    validate_transcription_settings,
 )
 
 
@@ -54,6 +58,28 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(Config({"max_recording_seconds": ""}).max_recording_seconds, 0)
         self.assertEqual(Config({"max_recording_seconds": 4}).max_recording_seconds, 5)
         self.assertEqual(Config({"max_recording_seconds": 999}).max_recording_seconds, 180)
+
+    def test_settings_recording_limit_parser_preserves_zero(self):
+        self.assertEqual(parse_max_recording_seconds("0"), 0)
+        self.assertEqual(parse_max_recording_seconds(""), 0)
+        self.assertEqual(parse_max_recording_seconds("4"), 5)
+        self.assertEqual(parse_max_recording_seconds("999"), 180)
+
+    def test_resampler_converts_without_audioop(self):
+        resampler = PCM16Resampler(16_000, 24_000)
+        first = resampler.convert(b"\x00\x00" * 160)
+        second = resampler.convert(b"\x00\x00" * 160)
+        self.assertGreater(len(first), 0)
+        self.assertGreater(len(second), 0)
+        self.assertEqual(len(first + second) // 2, 479)
+
+    def test_transcription_context_validation_rejects_api_invalid_values(self):
+        with self.assertRaises(ValueError):
+            validate_transcription_settings("", ["bad<keyword"], [])
+        with self.assertRaises(ValueError):
+            validate_transcription_settings("", [], ["english"])
+        with self.assertRaises(ValueError):
+            validate_transcription_settings("x" * 4_001, [], [])
 
     def test_transcription_settings_normalize_and_keep_legacy_language(self):
         config = Config(
@@ -198,6 +224,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(set_clipboard.call_args_list, [call("hello"), call(" world")])
         self.assertEqual(send_paste.call_count, 2)
         timer.assert_called_once()
+
+    def test_live_text_inserter_rejects_final_revision(self):
+        with patch.object(core, "read_clipboard_text", return_value="previous"), patch.object(
+            core, "set_clipboard_text"
+        ), patch.object(core, "_send_paste_shortcut"):
+            inserter = core.LiveTextInserter(None)
+            inserter.append("teh")
+            with self.assertRaises(LiveTextReconciliationError):
+                inserter.complete("the")
 
     def test_live_mode_does_not_paste_final_result_again(self):
         class LiveSession:

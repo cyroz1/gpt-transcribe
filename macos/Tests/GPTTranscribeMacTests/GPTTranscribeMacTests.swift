@@ -29,7 +29,17 @@ final class GPTTranscribeMacTests: XCTestCase {
 
         XCTAssertEqual(AppConfig(maxRecordingSeconds: 0).maxRecordingSeconds, 0)
         XCTAssertEqual(parseMaxRecordingSeconds(""), 0)
+        XCTAssertEqual(parseMaxRecordingSeconds("0"), 0)
         XCTAssertEqual(parseMaxRecordingSeconds("  "), 0)
+    }
+
+    func testRealtimeResamplerStreamsPCMWithoutDroppingChunks() {
+        let resampler = PCM16Resampler(inputRate: 16_000)
+        let first = resampler.convert(Data(repeating: 0, count: 320))
+        let second = resampler.convert(Data(repeating: 0, count: 320))
+        XCTAssertGreaterThan(first.count, 0)
+        XCTAssertGreaterThan(second.count, 0)
+        XCTAssertEqual((first.count + second.count) / 2, 479)
     }
 
     func testTranscriptionSettingsNormalize() {
@@ -42,6 +52,12 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertEqual(config.keywords, ["OpenAI", "AC-42"])
         XCTAssertEqual(config.languages, ["en", "fr"])
         XCTAssertEqual(parseSettingList("en, fr\n de"), ["en", "fr", "de"])
+    }
+
+    func testTranscriptionSettingsValidationRejectsInvalidContext() {
+        XCTAssertThrowsError(try validateTranscriptionSettings(prompt: "", keywords: ["bad<keyword"], languages: []))
+        XCTAssertThrowsError(try validateTranscriptionSettings(prompt: "", keywords: [], languages: ["english"]))
+        XCTAssertThrowsError(try validateTranscriptionSettings(prompt: String(repeating: "x", count: 4_001), keywords: [], languages: []))
     }
 
     func testRealtimeSettingDefaultsOnAndCanBeDisabled() {

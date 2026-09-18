@@ -21,6 +21,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Run offline Windows tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
       - name: Build application executable
         shell: pwsh
         run: .\build.ps1

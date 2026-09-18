@@ -2,18 +2,22 @@ import AppKit
 import AVFoundation
 import Carbon
 import CoreGraphics
+import Darwin
 import Foundation
 import ServiceManagement
 import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.4.1"
+private let appVersion = "0.5.0"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
 let realtimeURL = URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!
 let realtimeSampleRate = 24_000
+let realtimeCompletionTimeout: TimeInterval = 30
+let realtimeDeltaBatchInterval: TimeInterval = 0.1
+let maxTranscriptionPromptCharacters = 4_000
 private let defaultHotkey = "ctrl+shift+space"
 private let defaultMaxRecordingSeconds = 90
 let defaultRealtimeTranscription = true
@@ -44,6 +48,45 @@ func deleteFailedRecording(at url: URL = failedRecordingURL()) throws {
     let fileManager = FileManager.default
     guard fileManager.fileExists(atPath: url.path) else { return }
     try fileManager.removeItem(at: url)
+}
+
+final class SingleInstanceLock {
+    private var descriptor: Int32 = -1
+
+    func acquire() -> Bool {
+        guard descriptor < 0 else { return true }
+        do {
+            try FileManager.default.createDirectory(
+                at: appSupportDirectory(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return false
+        }
+        let lockURL = appSupportDirectory().appendingPathComponent(".instance.lock")
+        descriptor = lockURL.path.withCString { path in
+            Darwin.open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else { return false }
+        var fileLock = flock()
+        fileLock.l_type = Int16(F_WRLCK)
+        fileLock.l_whence = Int16(SEEK_SET)
+        guard Darwin.fcntl(descriptor, F_SETLK, &fileLock) == 0 else {
+            Darwin.close(descriptor)
+            descriptor = -1
+            return false
+        }
+        return true
+    }
+
+    deinit {
+        guard descriptor >= 0 else { return }
+        var fileLock = flock()
+        fileLock.l_type = Int16(F_UNLCK)
+        fileLock.l_whence = Int16(SEEK_SET)
+        _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
+        Darwin.close(descriptor)
+    }
 }
 
 final class AppLogger {
@@ -92,6 +135,41 @@ func parseSettingList(_ value: String) -> [String] {
         .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
+}
+
+enum TranscriptionSettingsError: LocalizedError {
+    case promptTooLong
+    case invalidKeyword
+    case invalidLanguage(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .promptTooLong:
+            return "Prompt is too long. Keep it under \(maxTranscriptionPromptCharacters) characters."
+        case .invalidKeyword:
+            return "Keywords cannot contain <, >, or line breaks."
+        case .invalidLanguage(let language):
+            return "Unsupported language code format: \(language)"
+        }
+    }
+}
+
+func validateTranscriptionSettings(prompt: String, keywords: [String], languages: [String]) throws {
+    guard prompt.count <= maxTranscriptionPromptCharacters else {
+        throw TranscriptionSettingsError.promptTooLong
+    }
+    for keyword in keywords where keyword.contains(where: { "<>\r\n".contains($0) }) {
+        throw TranscriptionSettingsError.invalidKeyword
+    }
+    for language in languages {
+        let normalized = language.lowercased()
+        let isShortCode = (normalized.count == 2 || normalized.count == 3)
+            && normalized.unicodeScalars.allSatisfy { ($0.value >= 97 && $0.value <= 122) }
+        let isRegionalChinese = ["zh-cn", "zh-tw", "zh-hk"].contains(normalized)
+        guard isShortCode || isRegionalChinese else {
+            throw TranscriptionSettingsError.invalidLanguage(language)
+        }
+    }
 }
 
 struct AppConfig {
@@ -149,7 +227,7 @@ struct AppConfig {
         if hotkey.isEmpty { hotkey = defaultHotkey }
         prompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         keywords = parseSettingList(keywords.joined(separator: "\n"))
-        languages = parseSettingList(languages.joined(separator: "\n"))
+        languages = parseSettingList(languages.joined(separator: "\n")).map { $0.lowercased() }
         maxRecordingSeconds = maxRecordingSeconds == 0 ? 0 : min(180, max(5, maxRecordingSeconds))
     }
 
@@ -593,6 +671,7 @@ final class RealtimeTranscriptionSession {
     private let apiKey: String
     private let config: AppConfig
     private let queue = DispatchQueue(label: "com.gpttranscribe.realtime")
+    private let pendingAudioSlots = DispatchSemaphore(value: 128)
     private var task: URLSessionWebSocketTask?
     private var resampler: PCM16Resampler?
     private var started = false
@@ -602,6 +681,10 @@ final class RealtimeTranscriptionSession {
     private var terminalResult: Result<String, Error>?
     private var completion: ((Result<String, Error>) -> Void)?
     private var resamplerInputRate: Int?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private var deltaFlushWorkItem: DispatchWorkItem?
+    private var pendingDelta = ""
+    private var itemID: String?
     private let onDelta: ((String) -> Void)?
 
     init(apiKey: String, config: AppConfig, onDelta: ((String) -> Void)? = nil) {
@@ -614,6 +697,7 @@ final class RealtimeTranscriptionSession {
         queue.async { [weak self] in
             guard let self, !self.started, !self.cancelled else { return }
             var request = URLRequest(url: realtimeURL)
+            request.timeoutInterval = 10
             request.setValue("Bearer \(self.apiKey)", forHTTPHeaderField: "Authorization")
             let task = URLSession.shared.webSocketTask(with: request)
             self.task = task
@@ -625,7 +709,14 @@ final class RealtimeTranscriptionSession {
     }
 
     func append(pcm: Data, sampleRate: Int) {
+        guard pendingAudioSlots.wait(timeout: .now()) == .success else {
+            queue.async { [weak self] in
+                self?.fail("Realtime audio could not keep up with the microphone.")
+            }
+            return
+        }
         queue.async { [weak self] in
+            defer { self?.pendingAudioSlots.signal() }
             guard let self, self.started, !self.cancelled, self.terminalResult == nil else { return }
             if self.resampler == nil || self.resamplerInputRate != sampleRate {
                 self.resampler = PCM16Resampler(inputRate: sampleRate)
@@ -660,6 +751,7 @@ final class RealtimeTranscriptionSession {
                 return
             }
             self.sendEvent(["type": "input_audio_buffer.commit"])
+            self.scheduleCompletionTimeout()
         }
     }
 
@@ -668,6 +760,11 @@ final class RealtimeTranscriptionSession {
             guard let self else { return }
             self.cancelled = true
             self.completion = nil
+            self.timeoutWorkItem?.cancel()
+            self.timeoutWorkItem = nil
+            self.deltaFlushWorkItem?.cancel()
+            self.deltaFlushWorkItem = nil
+            self.pendingDelta = ""
             self.task?.cancel(with: .goingAway, reason: nil)
             self.task = nil
         }
@@ -731,11 +828,20 @@ final class RealtimeTranscriptionSession {
 
         switch type {
         case "conversation.item.input_audio_transcription.delta":
+            if let eventItemID = event["item_id"] as? String {
+                if let currentItemID = self.itemID, currentItemID != eventItemID { return }
+                self.itemID = self.itemID ?? eventItemID
+            }
             if let delta = event["delta"] as? String, !delta.isEmpty {
                 transcriptDelta += delta
-                onDelta?(delta)
+                queueDelta(delta)
             }
         case "conversation.item.input_audio_transcription.completed":
+            if let eventItemID = event["item_id"] as? String {
+                if let currentItemID = self.itemID, currentItemID != eventItemID { return }
+                self.itemID = self.itemID ?? eventItemID
+            }
+            flushPendingDelta()
             let transcript = (event["transcript"] as? String ?? transcriptDelta)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             terminalResult = .success(transcript)
@@ -750,17 +856,49 @@ final class RealtimeTranscriptionSession {
 
     private func fail(_ message: String) {
         terminalResult = .failure(TranscriptionError.request(String(message.prefix(400))))
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
         if completion != nil { complete(terminalResult!) }
     }
 
     private func complete(_ result: Result<String, Error>) {
         guard let completion else { return }
         self.completion = nil
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         DispatchQueue.main.async {
             completion(result)
         }
+    }
+
+    private func queueDelta(_ delta: String) {
+        pendingDelta += delta
+        guard deltaFlushWorkItem == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.flushPendingDelta()
+        }
+        deltaFlushWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + realtimeDeltaBatchInterval, execute: workItem)
+    }
+
+    private func flushPendingDelta() {
+        deltaFlushWorkItem = nil
+        guard !pendingDelta.isEmpty else { return }
+        let delta = pendingDelta
+        pendingDelta = ""
+        onDelta?(delta)
+    }
+
+    private func scheduleCompletionTimeout() {
+        timeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.terminalResult == nil, !self.cancelled else { return }
+            self.fail("Realtime transcription timed out.")
+        }
+        timeoutWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + realtimeCompletionTimeout, execute: workItem)
     }
 }
 
@@ -877,49 +1015,62 @@ func apiErrorMessage(data: Data, status: Int) -> String {
 
 final class TranscriptionClient {
     func transcribe(audio: Data, config: AppConfig, apiKey: String, completion: @escaping (Result<String, Error>) -> Void) {
-        var fields = ["model": fileTranscriptionModel, "response_format": "json"]
-        if !config.prompt.isEmpty { fields["prompt"] = config.prompt }
-        let multipart = buildMultipart(
-            fields: fields,
-            repeatedFields: [
-                "keywords[]": config.keywords,
-                "languages[]": config.languages,
-            ],
-            filename: "dictation.wav",
-            file: audio,
-            mimeType: "audio/wav"
-        )
+        do {
+            try validateTranscriptionSettings(
+                prompt: config.prompt,
+                keywords: config.keywords,
+                languages: config.languages
+            )
+        } catch {
+            completion(.failure(error))
+            return
+        }
 
-        var request = URLRequest(url: transcriptionURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 180
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        DispatchQueue.global(qos: .utility).async {
+            var fields = ["model": fileTranscriptionModel, "response_format": "json"]
+            if !config.prompt.isEmpty { fields["prompt"] = config.prompt }
+            let multipart = buildMultipart(
+                fields: fields,
+                repeatedFields: [
+                    "keywords[]": config.keywords,
+                    "languages[]": config.languages,
+                ],
+                filename: "dictation.wav",
+                file: audio,
+                mimeType: "audio/wav"
+            )
 
-        URLSession.shared.uploadTask(with: request, from: multipart.body) { data, response, error in
-            if let error {
-                completion(.failure(TranscriptionError.request("Could not reach OpenAI: \(error.localizedDescription)")))
-                return
-            }
-            guard let httpResponse = response as? HTTPURLResponse, let data else {
-                completion(.failure(TranscriptionError.invalidResponse))
-                return
-            }
-            guard (200..<300).contains(httpResponse.statusCode) else {
-                completion(.failure(TranscriptionError.request(apiErrorMessage(data: data, status: httpResponse.statusCode))))
-                return
-            }
-            guard
-                let object = try? JSONSerialization.jsonObject(with: data),
-                let payload = object as? [String: Any],
-                let text = payload["text"] as? String
-            else {
-                completion(.failure(TranscriptionError.invalidResponse))
-                return
-            }
-            completion(.success(text.trimmingCharacters(in: .whitespacesAndNewlines)))
-        }.resume()
+            var request = URLRequest(url: transcriptionURL)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 180
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("multipart/form-data; boundary=\(multipart.boundary)", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            URLSession.shared.uploadTask(with: request, from: multipart.body) { data, response, error in
+                if let error {
+                    completion(.failure(TranscriptionError.request("Could not reach OpenAI: \(error.localizedDescription)")))
+                    return
+                }
+                guard let httpResponse = response as? HTTPURLResponse, let data else {
+                    completion(.failure(TranscriptionError.invalidResponse))
+                    return
+                }
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    completion(.failure(TranscriptionError.request(apiErrorMessage(data: data, status: httpResponse.statusCode))))
+                    return
+                }
+                guard
+                    let object = try? JSONSerialization.jsonObject(with: data),
+                    let payload = object as? [String: Any],
+                    let text = payload["text"] as? String
+                else {
+                    completion(.failure(TranscriptionError.invalidResponse))
+                    return
+                }
+                completion(.success(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+            }.resume()
+        }
     }
 }
 
@@ -1008,6 +1159,7 @@ enum PasteError: LocalizedError {
     case couldNotWriteClipboard
     case couldNotPostPaste
     case accessibilityRequired
+    case liveTranscriptChanged
 
     var errorDescription: String? {
         switch self {
@@ -1017,6 +1169,8 @@ enum PasteError: LocalizedError {
             return "Could not create the macOS paste event."
         case .accessibilityRequired:
             return "Allow GPT Transcribe in \(pastePermissionSettingsLocation()) to paste into other apps."
+        case .liveTranscriptChanged:
+            return "Live transcription revised earlier text; partial text was left in place."
         }
     }
 }
@@ -1029,6 +1183,10 @@ final class LiveTextInserter {
     private var lastClipboardText: String?
     private var closed = false
     private var error: Error?
+    private let stateLock = NSLock()
+    private let pendingLock = NSLock()
+    private var pendingText = ""
+    private var drainScheduled = false
 
     init(application: NSRunningApplication?) {
         self.application = application
@@ -1036,17 +1194,49 @@ final class LiveTextInserter {
     }
 
     func append(_ text: String) {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty, !isClosed() else { return }
+        pendingLock.lock()
+        pendingText.append(text)
+        let shouldSchedule = !drainScheduled
+        drainScheduled = true
+        pendingLock.unlock()
+        guard shouldSchedule else { return }
         queue.async { [weak self] in
-            guard let self, !self.closed, self.error == nil else { return }
+            self?.drainPendingText()
+        }
+    }
+
+    private func drainPendingText() {
+        while true {
+            guard !isClosed(), error == nil else {
+                clearPendingText()
+                return
+            }
+
+            pendingLock.lock()
+            let text = pendingText
+            pendingText = ""
+            if text.isEmpty {
+                drainScheduled = false
+                pendingLock.unlock()
+                return
+            }
+            pendingLock.unlock()
+
             do {
-                try self.pasteChunk(text)
-                self.insertedText += text
-                self.lastClipboardText = text
+                try pasteChunk(text)
+                guard !isClosed() else {
+                    clearPendingText()
+                    return
+                }
+                insertedText += text
+                lastClipboardText = text
             } catch {
                 self.error = error
-                self.closed = true
-                self.scheduleClipboardRestore()
+                markClosed()
+                clearPendingText()
+                scheduleClipboardRestore()
+                return
             }
         }
     }
@@ -1057,11 +1247,12 @@ final class LiveTextInserter {
                 DispatchQueue.main.async { completion(.success(false)) }
                 return
             }
+            self.drainPendingText()
             if let error = self.error {
                 DispatchQueue.main.async { completion(.failure(error)) }
                 return
             }
-            if self.closed {
+            if self.isClosed() {
                 DispatchQueue.main.async { completion(.success(!self.insertedText.isEmpty)) }
                 return
             }
@@ -1081,14 +1272,18 @@ final class LiveTextInserter {
                         self.insertedText += suffix
                         self.lastClipboardText = suffix
                     }
+                } else {
+                    throw PasteError.liveTranscriptChanged
                 }
-                self.closed = true
+                self.markClosed()
+                self.clearPendingText()
                 self.scheduleClipboardRestore()
                 let inserted = !self.insertedText.isEmpty
                 DispatchQueue.main.async { completion(.success(inserted)) }
             } catch {
                 self.error = error
-                self.closed = true
+                self.markClosed()
+                self.clearPendingText()
                 self.scheduleClipboardRestore()
                 DispatchQueue.main.async { completion(.failure(error)) }
             }
@@ -1096,11 +1291,30 @@ final class LiveTextInserter {
     }
 
     func abort() {
+        markClosed()
+        clearPendingText()
         queue.async { [weak self] in
-            guard let self, !self.closed else { return }
-            self.closed = true
-            self.scheduleClipboardRestore()
+            self?.scheduleClipboardRestore()
         }
+    }
+
+    private func isClosed() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return closed
+    }
+
+    private func markClosed() {
+        stateLock.lock()
+        closed = true
+        stateLock.unlock()
+    }
+
+    private func clearPendingText() {
+        pendingLock.lock()
+        pendingText = ""
+        drainScheduled = false
+        pendingLock.unlock()
     }
 
     private func pasteChunk(_ text: String) throws {
@@ -1118,7 +1332,7 @@ final class LiveTextInserter {
             return .success(())
         }
 
-        Thread.sleep(forTimeInterval: 0.18)
+        Thread.sleep(forTimeInterval: 0.12)
         try runOnMain {
             guard hasAccessibilityPermission() else {
                 return .failure(PasteError.accessibilityRequired)
@@ -1136,7 +1350,7 @@ final class LiveTextInserter {
             keyUp.post(tap: .cghidEventTap)
             return .success(())
         }
-        Thread.sleep(forTimeInterval: 0.08)
+        Thread.sleep(forTimeInterval: 0.04)
     }
 
     private func runOnMain(_ work: @escaping () -> Result<Void, Error>) throws {
@@ -1396,6 +1610,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let audioRecorder = AudioRecorder()
     private let transcriptionClient = TranscriptionClient()
     private let hotKeyManager = HotKeyManager()
+    private let instanceLock = SingleInstanceLock()
     private var config = AppConfig()
     private var realtimeSession: RealtimeTranscriptionSession?
     private var liveTextInserter: LiveTextInserter?
@@ -1412,6 +1627,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusNotificationIdentifier = "com.gpttranscribe.status"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard instanceLock.acquire() else {
+            let bundleIdentifier = Bundle.main.bundleIdentifier
+            if let bundleIdentifier,
+               let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+                .first(where: { $0 != NSRunningApplication.current }) {
+                existing.activate(options: [.activateIgnoringOtherApps])
+            }
+            logger.error("Another GPT Transcribe instance is already running.")
+            NSApp.terminate(nil)
+            return
+        }
         NSApp.setActivationPolicy(.accessory)
         config = configStore.load()
         let savedRecording = failedRecordingURL()
@@ -1423,6 +1649,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         requestNotificationPermission()
         clearPreviousNotifications()
         logger.info("Started GPT Transcribe macOS \(appVersion)")
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard state == .idle else {
+            notify(title: appName, message: "Please wait for the current dictation to finish before quitting.")
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1545,6 +1779,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             openSettings()
             return
         }
+        do {
+            try validateTranscriptionSettings(
+                prompt: config.prompt,
+                keywords: config.keywords,
+                languages: config.languages
+            )
+        } catch {
+            setStatus(error.localizedDescription, notify: true)
+            return
+        }
 
         guard requireAccessibilityPermission() else { return }
 
@@ -1610,26 +1854,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status = "Transcribing…"
         updateStatusItem()
 
-        let audio = makeWAV(pcm: recording.pcm, sampleRate: recording.sampleRate)
-        guard audio.count >= 1_000 else {
-            activeRealtimeSession?.cancel()
-            activeLiveTextInserter?.abort()
-            if let activeRealtimeSession, realtimeSession === activeRealtimeSession {
-                realtimeSession = nil
+        let pcm = recording.pcm
+        let sampleRate = recording.sampleRate
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let audio = makeWAV(pcm: pcm, sampleRate: sampleRate)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard audio.count >= 1_000 else {
+                    activeRealtimeSession?.cancel()
+                    activeLiveTextInserter?.abort()
+                    if let activeRealtimeSession, self.realtimeSession === activeRealtimeSession {
+                        self.realtimeSession = nil
+                    }
+                    if let activeLiveTextInserter, self.liveTextInserter === activeLiveTextInserter {
+                        self.liveTextInserter = nil
+                    }
+                    self.finish(status: "No audio captured", notify: true)
+                    return
+                }
+                self.transcribeAndPaste(
+                    audio: audio,
+                    target: target,
+                    pendingURL: nil,
+                    realtimeSession: activeRealtimeSession,
+                    liveTextInserter: activeLiveTextInserter
+                )
             }
-            if let activeLiveTextInserter, liveTextInserter === activeLiveTextInserter {
-                liveTextInserter = nil
-            }
-            finish(status: "No audio captured", notify: true)
-            return
         }
-        transcribeAndPaste(
-            audio: audio,
-            target: target,
-            pendingURL: nil,
-            realtimeSession: activeRealtimeSession,
-            liveTextInserter: activeLiveTextInserter
-        )
     }
 
     private func transcribeAndPaste(
@@ -1908,6 +2159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func saveSettings(_ newConfig: AppConfig, apiKey: String) {
         let previousConfig = config
         do {
+            try validateTranscriptionSettings(
+                prompt: newConfig.prompt,
+                keywords: newConfig.keywords,
+                languages: newConfig.languages
+            )
             if newConfig.launchAtLogin != config.launchAtLogin {
                 try LaunchAtLogin.setEnabled(newConfig.launchAtLogin)
             }
@@ -1923,6 +2179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setStatus("Settings saved")
         } catch {
             config = previousConfig
+            if newConfig.launchAtLogin != previousConfig.launchAtLogin {
+                try? LaunchAtLogin.setEnabled(previousConfig.launchAtLogin)
+            }
             setStatus(error.localizedDescription, notify: true)
             showAlert(title: "Could not save settings", message: error.localizedDescription, parent: settingsWindowController?.window)
             registerHotkey()
