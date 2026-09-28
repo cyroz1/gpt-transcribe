@@ -9,7 +9,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.5.0"
+private let appVersion = "0.5.1"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
@@ -1619,6 +1619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var recordingTimer: Timer?
+    private var recordingConfigSnapshot: AppConfig?
     private var targetApplication: NSRunningApplication?
     private var pendingRecordingURL: URL?
     private var settingsWindowController: SettingsWindowController?
@@ -1795,6 +1796,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state = .starting
         targetApplication = currentTargetApplication()
         let configSnapshot = config
+        recordingConfigSnapshot = configSnapshot
         let inserter = configSnapshot.realtimeTranscription
             ? LiveTextInserter(application: targetApplication)
             : nil
@@ -1822,12 +1824,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateStatusItem()
                     self.recordingTimer?.invalidate()
                     self.recordingTimer = nil
-                    if self.config.maxRecordingSeconds > 0 {
-                        self.recordingTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(self.config.maxRecordingSeconds), repeats: false) { [weak self] _ in
+                    let maxRecordingSeconds = self.recordingConfigSnapshot?.maxRecordingSeconds ?? self.config.maxRecordingSeconds
+                    if maxRecordingSeconds > 0 {
+                        self.recordingTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(maxRecordingSeconds), repeats: false) { [weak self] _ in
                             self?.stopRecording()
                         }
                     }
                 case .failure(let error):
+                    self.recordingConfigSnapshot = nil
                     self.realtimeSession?.cancel()
                     self.realtimeSession = nil
                     self.liveTextInserter?.abort()
@@ -1847,6 +1851,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let recording = audioRecorder.stop()
         let activeRealtimeSession = realtimeSession
         let activeLiveTextInserter = liveTextInserter
+        let activeConfigSnapshot = recordingConfigSnapshot ?? config
+        recordingConfigSnapshot = nil
         // Keep both objects strongly retained until the asynchronous finish
         // and final paste reconciliation callbacks have completed.
         let target = targetApplication
@@ -1877,7 +1883,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     target: target,
                     pendingURL: nil,
                     realtimeSession: activeRealtimeSession,
-                    liveTextInserter: activeLiveTextInserter
+                    liveTextInserter: activeLiveTextInserter,
+                    configSnapshot: activeConfigSnapshot
                 )
             }
         }
@@ -1888,7 +1895,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         target: NSRunningApplication?,
         pendingURL: URL?,
         realtimeSession: RealtimeTranscriptionSession? = nil,
-        liveTextInserter: LiveTextInserter? = nil
+        liveTextInserter: LiveTextInserter? = nil,
+        configSnapshot recordingConfigSnapshot: AppConfig? = nil
     ) {
         guard audio.count >= 1_000 else {
             realtimeSession?.cancel()
@@ -1915,7 +1923,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             finish(status: failureStatus(TranscriptionError.missingAPIKey.localizedDescription, saved: saved), notify: true)
             return
         }
-        let configSnapshot = config
+        let configSnapshot = recordingConfigSnapshot ?? config
         let clearLiveResources: () -> Void = { [weak self] in
             guard let self else { return }
             if let realtimeSession, self.realtimeSession === realtimeSession {
