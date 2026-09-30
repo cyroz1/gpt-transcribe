@@ -32,7 +32,7 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 # Keep MODEL as the file-transcription default for callers that imported the
@@ -47,7 +47,7 @@ DEFAULT_MAX_RECORDING_SECONDS = 90
 DEFAULT_REALTIME_TRANSCRIPTION = True
 REALTIME_COMPLETION_TIMEOUT = 30
 REALTIME_AUDIO_QUEUE_MAXSIZE = 128
-REALTIME_DELTA_BATCH_INTERVAL = 0.1
+REALTIME_DELTA_BATCH_INTERVAL = 0.25
 MAX_TRANSCRIPTION_PROMPT_CHARACTERS = 4_000
 MIN_MAX_RECORDING_SECONDS = 5
 MAX_MAX_RECORDING_SECONDS = 180
@@ -1016,6 +1016,26 @@ def paste_text(text: str, target_window: int | None) -> None:
     restore_timer.start()
 
 
+def _needs_live_word_separator(previous_text: str, next_text: str) -> bool:
+    """Return whether adjacent live paste chunks need a word boundary."""
+    if not previous_text or not next_text:
+        return False
+    previous = previous_text[-1]
+    following = next_text[0]
+    if previous.isspace() or following.isspace() or not following.isalnum():
+        return False
+    if previous.isalnum():
+        return True
+    if previous in ",.!?;:":
+        if previous in ",:" and following.isdigit():
+            return False
+        if previous == "." and following.isdigit() and len(previous_text) > 1:
+            if previous_text[-2].isdigit():
+                return False
+        return True
+    return previous in ")]}”’\""
+
+
 class LiveTextInserter:
     """Paste each live delta into the window captured at recording start."""
 
@@ -1027,9 +1047,11 @@ class LiveTextInserter:
         self._inserted_text = ""
         self._last_clipboard_text: str | None = None
 
-    def _append_locked(self, text: str) -> None:
+    def _append_locked(self, text: str, *, normalize_boundary: bool = False) -> None:
         if not text:
             return
+        if normalize_boundary and _needs_live_word_separator(self._inserted_text, text):
+            text = " " + text
         set_clipboard_text(text)
         _send_paste_shortcut(self.target_window)
         # Give the target application time to consume this chunk before the
@@ -1044,7 +1066,7 @@ class LiveTextInserter:
         with self._lock:
             if self._closed:
                 raise RuntimeError("Live transcript insertion is no longer active.")
-            self._append_locked(text)
+            self._append_locked(text, normalize_boundary=True)
 
     def complete(self, transcript: str) -> bool:
         """Append only the final suffix and report whether text was inserted."""
