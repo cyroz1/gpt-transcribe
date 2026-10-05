@@ -9,7 +9,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.5.2"
+private let appVersion = "0.5.3"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
@@ -1175,18 +1175,6 @@ enum PasteError: LocalizedError {
     }
 }
 
-private func needsLiveWordSeparator(previous: String, next: String) -> Bool {
-    guard let left = previous.last, let right = next.first else { return false }
-    guard !left.isWhitespace, !right.isWhitespace, right.isLetter || right.isNumber else { return false }
-    if left.isLetter || left.isNumber { return true }
-    if ",.!?;:".contains(left) {
-        if (left == "," || left == ":") && right.isNumber { return false }
-        if left == ".", right.isNumber, previous.dropLast().last?.isNumber == true { return false }
-        return true
-    }
-    return ")]}”’\"".contains(left)
-}
-
 final class LiveTextInserter {
     private let application: NSRunningApplication?
     private let queue = DispatchQueue(label: "com.gpttranscribe.live-paste")
@@ -1235,15 +1223,16 @@ final class LiveTextInserter {
             }
             pendingLock.unlock()
 
-            let pasteText = needsLiveWordSeparator(previous: insertedText, next: text) ? " " + text : text
             do {
-                try pasteChunk(pasteText)
+                // Realtime deltas are arbitrary text fragments, not word boundaries.
+                // Preserve them verbatim so the inserted text matches the final transcript.
+                try pasteChunk(text)
                 guard !isClosed() else {
                     clearPendingText()
                     return
                 }
-                insertedText += pasteText
-                lastClipboardText = pasteText
+                insertedText += text
+                lastClipboardText = text
             } catch {
                 self.error = error
                 markClosed()
