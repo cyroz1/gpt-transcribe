@@ -143,9 +143,22 @@ final class GPTTranscribeMacTests: XCTestCase {
         let path = try saveFailedRecording(Data("first".utf8), in: directory)
         XCTAssertEqual(path, failedRecordingURL(in: directory))
         XCTAssertEqual(try Data(contentsOf: path), Data("first".utf8))
+        XCTAssertFalse(failedRecordingRequiresManualInsert(at: path))
 
-        _ = try saveFailedRecording(Data("latest".utf8), in: directory)
+        try markFailedRecordingForManualInsert(at: path)
+        XCTAssertTrue(failedRecordingRequiresManualInsert(at: path))
+
+        _ = try saveFailedRecording(
+            Data("latest".utf8),
+            retryRequiresManualInsert: false,
+            in: directory
+        )
+        XCTAssertFalse(failedRecordingRequiresManualInsert(at: path))
+
         XCTAssertEqual(try Data(contentsOf: path), Data("latest".utf8))
+
+        try Data("changed".utf8).write(to: path)
+        XCTAssertTrue(failedRecordingRequiresManualInsert(at: path))
 
         try deleteFailedRecording(at: path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))

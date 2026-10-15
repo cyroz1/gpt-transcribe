@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Carbon
 import CoreGraphics
+import CryptoKit
 import Darwin
 import Foundation
 import ServiceManagement
@@ -9,7 +10,7 @@ import Security
 import UserNotifications
 
 private let appName = "GPT Transcribe"
-private let appVersion = "0.5.3"
+private let appVersion = "0.5.4"
 let fileTranscriptionModel = "gpt-transcribe"
 let realtimeTranscriptionModel = "gpt-live-transcribe"
 private let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
@@ -22,6 +23,7 @@ private let defaultHotkey = "ctrl+shift+space"
 private let defaultMaxRecordingSeconds = 90
 let defaultRealtimeTranscription = true
 private let failedRecordingFilename = "failed-recording.wav"
+private let failedRecordingMetadataFilename = "failed-recording.json"
 
 // MARK: - Local storage and logging
 
@@ -35,19 +37,70 @@ func failedRecordingURL(in directory: URL = appSupportDirectory()) -> URL {
     directory.appendingPathComponent(failedRecordingFilename, isDirectory: false)
 }
 
+private struct FailedRecordingMetadata: Codable {
+    let audioSHA256: String
+    let retryRequiresManualInsert: Bool
+}
+
+private func failedRecordingMetadataURL(for recordingURL: URL) -> URL {
+    recordingURL.deletingLastPathComponent().appendingPathComponent(failedRecordingMetadataFilename)
+}
+
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func failedRecordingRequiresManualInsert(at url: URL = failedRecordingURL()) -> Bool {
+    guard FileManager.default.fileExists(atPath: url.path) else { return false }
+    guard
+        let audio = try? Data(contentsOf: url),
+        let metadataData = try? Data(contentsOf: failedRecordingMetadataURL(for: url)),
+        let metadata = try? JSONDecoder().decode(FailedRecordingMetadata.self, from: metadataData)
+    else {
+        // A legacy or incomplete retry record may have followed a live failure
+        // with text already pasted. Avoid automatically pasting a duplicate.
+        return true
+    }
+    return metadata.audioSHA256 != sha256Hex(audio) || metadata.retryRequiresManualInsert
+}
+
+func markFailedRecordingForManualInsert(at url: URL) throws {
+    let audio = try Data(contentsOf: url)
+    let metadata = FailedRecordingMetadata(
+        audioSHA256: sha256Hex(audio),
+        retryRequiresManualInsert: true
+    )
+    let metadataData = try JSONEncoder().encode(metadata)
+    try metadataData.write(to: failedRecordingMetadataURL(for: url), options: [.atomic])
+}
+
 @discardableResult
-func saveFailedRecording(_ audio: Data, in directory: URL = appSupportDirectory()) throws -> URL {
+func saveFailedRecording(
+    _ audio: Data,
+    retryRequiresManualInsert: Bool = false,
+    in directory: URL = appSupportDirectory()
+) throws -> URL {
     let fileManager = FileManager.default
     try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     let url = failedRecordingURL(in: directory)
+    let metadata = FailedRecordingMetadata(
+        audioSHA256: sha256Hex(audio),
+        retryRequiresManualInsert: retryRequiresManualInsert
+    )
+    let metadataData = try JSONEncoder().encode(metadata)
+    // Write metadata first so an interrupted WAV replacement leaves a hash
+    // mismatch. The next launch then falls back to clipboard-only retry.
+    try metadataData.write(to: failedRecordingMetadataURL(for: url), options: [.atomic])
     try audio.write(to: url, options: [.atomic])
     return url
 }
 
 func deleteFailedRecording(at url: URL = failedRecordingURL()) throws {
     let fileManager = FileManager.default
-    guard fileManager.fileExists(atPath: url.path) else { return }
-    try fileManager.removeItem(at: url)
+    if fileManager.fileExists(atPath: url.path) {
+        try fileManager.removeItem(at: url)
+    }
+    try? fileManager.removeItem(at: failedRecordingMetadataURL(for: url))
 }
 
 final class SingleInstanceLock {
@@ -1115,19 +1168,21 @@ enum LaunchAtLogin {
 }
 
 func pasteText(_ text: String, into application: NSRunningApplication?, completion: @escaping (Result<Void, Error>) -> Void) {
-    let pasteboard = NSPasteboard.general
-    let previous = pasteboard.string(forType: .string)
-    pasteboard.clearContents()
-    guard pasteboard.setString(text, forType: .string) else {
-        completion(.failure(PasteError.couldNotWriteClipboard))
+    guard let application, !application.isTerminated else {
+        completion(.failure(PasteError.targetUnavailable))
         return
     }
 
-    if let application {
-        application.activate(options: [.activateIgnoringOtherApps])
-    }
+    application.activate(options: [.activateIgnoringOtherApps])
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+        guard
+            !application.isTerminated,
+            NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier
+        else {
+            completion(.failure(PasteError.targetUnavailable))
+            return
+        }
         guard hasAccessibilityPermission() else {
             completion(.failure(PasteError.accessibilityRequired))
             return
@@ -1138,6 +1193,17 @@ func pasteText(_ text: String, into application: NSRunningApplication?, completi
             let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
         else {
             completion(.failure(PasteError.couldNotPostPaste))
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        let previous = pasteboard.string(forType: .string)
+        pasteboard.clearContents()
+        guard pasteboard.setString(text, forType: .string) else {
+            completion(.failure(PasteError.couldNotWriteClipboard))
+            return
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else {
+            completion(.failure(PasteError.targetUnavailable))
             return
         }
         keyDown.flags = .maskCommand
@@ -1155,10 +1221,19 @@ func pasteText(_ text: String, into application: NSRunningApplication?, completi
     }
 }
 
+func copyTextToClipboard(_ text: String) throws {
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    guard pasteboard.setString(text, forType: .string) else {
+        throw PasteError.couldNotWriteClipboard
+    }
+}
+
 enum PasteError: LocalizedError {
     case couldNotWriteClipboard
     case couldNotPostPaste
     case accessibilityRequired
+    case targetUnavailable
     case liveTranscriptChanged
 
     var errorDescription: String? {
@@ -1169,6 +1244,8 @@ enum PasteError: LocalizedError {
             return "Could not create the macOS paste event."
         case .accessibilityRequired:
             return "Allow GPT Transcribe in \(pastePermissionSettingsLocation()) to paste into other apps."
+        case .targetUnavailable:
+            return "The original target app is unavailable or could not be activated; transcript was not pasted."
         case .liveTranscriptChanged:
             return "Live transcription revised earlier text; partial text was left in place."
         }
@@ -1183,6 +1260,7 @@ final class LiveTextInserter {
     private var lastClipboardText: String?
     private var closed = false
     private var error: Error?
+    private var hasInsertedAnyText = false
     private let stateLock = NSLock()
     private let pendingLock = NSLock()
     private var pendingText = ""
@@ -1227,12 +1305,16 @@ final class LiveTextInserter {
                 // Realtime deltas are arbitrary text fragments, not word boundaries.
                 // Preserve them verbatim so the inserted text matches the final transcript.
                 try pasteChunk(text)
-                guard !isClosed() else {
+                stateLock.lock()
+                insertedText += text
+                lastClipboardText = text
+                hasInsertedAnyText = true
+                let wasClosed = closed
+                stateLock.unlock()
+                guard !wasClosed else {
                     clearPendingText()
                     return
                 }
-                insertedText += text
-                lastClipboardText = text
             } catch {
                 self.error = error
                 markClosed()
@@ -1266,6 +1348,9 @@ final class LiveTextInserter {
                     if !normalized.isEmpty {
                         self.insertedText = normalized
                         self.lastClipboardText = normalized
+                        self.stateLock.lock()
+                        self.hasInsertedAnyText = true
+                        self.stateLock.unlock()
                     }
                 } else if normalized.hasPrefix(self.insertedText) {
                     let suffix = String(normalized.dropFirst(self.insertedText.count))
@@ -1273,6 +1358,9 @@ final class LiveTextInserter {
                     if !suffix.isEmpty {
                         self.insertedText += suffix
                         self.lastClipboardText = suffix
+                        self.stateLock.lock()
+                        self.hasInsertedAnyText = true
+                        self.stateLock.unlock()
                     }
                 } else {
                     throw PasteError.liveTranscriptChanged
@@ -1300,6 +1388,12 @@ final class LiveTextInserter {
         }
     }
 
+    var hasInsertedText: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return hasInsertedAnyText
+    }
+
     private func isClosed() -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -1322,20 +1416,22 @@ final class LiveTextInserter {
     private func pasteChunk(_ text: String) throws {
         guard !text.isEmpty else { return }
         try runOnMain {
-            guard hasAccessibilityPermission() else {
-                return .failure(PasteError.accessibilityRequired)
+            guard let application = self.application, !application.isTerminated else {
+                return .failure(PasteError.targetUnavailable)
             }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            guard pasteboard.setString(text, forType: .string) else {
-                return .failure(PasteError.couldNotWriteClipboard)
-            }
-            self.application?.activate(options: [.activateIgnoringOtherApps])
+            application.activate(options: [.activateIgnoringOtherApps])
             return .success(())
         }
 
         Thread.sleep(forTimeInterval: 0.12)
         try runOnMain {
+            guard
+                let application = self.application,
+                !application.isTerminated,
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier
+            else {
+                return .failure(PasteError.targetUnavailable)
+            }
             guard hasAccessibilityPermission() else {
                 return .failure(PasteError.accessibilityRequired)
             }
@@ -1345,6 +1441,14 @@ final class LiveTextInserter {
                 let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
             else {
                 return .failure(PasteError.couldNotPostPaste)
+            }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
+                return .failure(PasteError.couldNotWriteClipboard)
+            }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else {
+                return .failure(PasteError.targetUnavailable)
             }
             keyDown.flags = .maskCommand
             keyUp.flags = .maskCommand
@@ -1414,7 +1518,7 @@ final class SettingsWindowController: NSWindowController {
 
     init(config: AppConfig, keychainKeyExists: Bool, saveHandler: @escaping (AppConfig, String) -> Void, removeKeyHandler: @escaping () -> Void) {
         self.hotkeyField = NSTextField(string: config.hotkey)
-        self.realtimeTranscriptionButton = NSButton(checkboxWithTitle: "Use live-transcribe (stream into focused text box)", target: nil, action: nil)
+        self.realtimeTranscriptionButton = NSButton(checkboxWithTitle: "Use live-transcribe (stream into active app)", target: nil, action: nil)
         self.languagesField = NSTextField(string: config.languages.joined(separator: ", "))
         self.promptField = NSTextField(string: config.prompt)
         self.keywordsField = NSTextField(string: config.keywords.joined(separator: ", "))
@@ -1468,7 +1572,7 @@ final class SettingsWindowController: NSWindowController {
         heading.font = .boldSystemFont(ofSize: 18)
         stack.addArrangedSubview(heading)
 
-        let subtitle = NSTextField(labelWithString: "Dictate into the text field that was focused when listening started.")
+        let subtitle = NSTextField(labelWithString: "Text goes to the focused field in the app active when listening starts.")
         subtitle.textColor = .secondaryLabelColor
         stack.addArrangedSubview(subtitle)
 
@@ -1624,6 +1728,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recordingConfigSnapshot: AppConfig?
     private var targetApplication: NSRunningApplication?
     private var pendingRecordingURL: URL?
+    private var pendingTargetApplication: NSRunningApplication?
+    private var pendingRetryRequiresManualInsert = false
     private var settingsWindowController: SettingsWindowController?
     private var accessibilitySettingsOpened = false
     private let notificationCenter = UNUserNotificationCenter.current()
@@ -1646,6 +1752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let savedRecording = failedRecordingURL()
         if FileManager.default.fileExists(atPath: savedRecording.path) {
             pendingRecordingURL = savedRecording
+            pendingRetryRequiresManualInsert = failedRecordingRequiresManualInsert(at: savedRecording)
+                || (pendingTargetApplication?.isTerminated ?? true)
         }
         buildStatusItem()
         registerHotkey()
@@ -1697,7 +1805,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modeItem.target = self
         modeItem.isEnabled = state == .idle
         menu.addItem(modeItem)
-        let retryItem = NSMenuItem(title: "Retry failed recording", action: #selector(retryFailedRecording), keyEquivalent: "")
+        let targetUnavailable = pendingTargetApplication?.isTerminated ?? true
+        let retryTitle = pendingRetryRequiresManualInsert || targetUnavailable
+            ? "Retry failed recording (copy transcript)"
+            : "Retry failed recording"
+        let retryItem = NSMenuItem(title: retryTitle, action: #selector(retryFailedRecording), keyEquivalent: "")
         retryItem.target = self
         retryItem.isEnabled = canRetry
         menu.addItem(retryItem)
@@ -1793,10 +1905,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        guard let target = currentTargetApplication(), !target.isTerminated else {
+            setStatus("Select a target app before recording", notify: true)
+            return
+        }
         guard requireAccessibilityPermission() else { return }
 
         state = .starting
-        targetApplication = currentTargetApplication()
+        targetApplication = target
         let configSnapshot = config
         recordingConfigSnapshot = configSnapshot
         let inserter = configSnapshot.realtimeTranscription
@@ -1898,7 +2014,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pendingURL: URL?,
         realtimeSession: RealtimeTranscriptionSession? = nil,
         liveTextInserter: LiveTextInserter? = nil,
-        configSnapshot recordingConfigSnapshot: AppConfig? = nil
+        configSnapshot recordingConfigSnapshot: AppConfig? = nil,
+        retryRequiresManualInsert: Bool = false
     ) {
         guard audio.count >= 1_000 else {
             realtimeSession?.cancel()
@@ -1921,11 +2038,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let liveTextInserter, self.liveTextInserter === liveTextInserter {
                 self.liveTextInserter = nil
             }
-            let saved = saveForRetry(audio)
+            let saved = saveForRetry(
+                audio,
+                target: target,
+                retryRequiresManualInsert: retryRequiresManualInsert || liveTextInserter != nil
+            )
             finish(status: failureStatus(TranscriptionError.missingAPIKey.localizedDescription, saved: saved), notify: true)
             return
         }
         let configSnapshot = recordingConfigSnapshot ?? config
+        let retryMustCopyTranscript = retryRequiresManualInsert || liveTextInserter != nil
         let clearLiveResources: () -> Void = { [weak self] in
             guard let self else { return }
             if let realtimeSession, self.realtimeSession === realtimeSession {
@@ -1953,7 +2075,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     )
                 case .failure(let error):
                     clearLiveResources()
-                    let saved = self.saveForRetry(audio)
+                    let saved = self.saveForRetry(
+                        audio,
+                        target: target,
+                        retryRequiresManualInsert: retryMustCopyTranscript || pendingURL != nil
+                    )
                     self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                 }
             }
@@ -1970,7 +2096,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 handlePasteResult(.success(()))
                             case .success:
                                 clearLiveResources()
-                                let saved = self.saveForRetry(audio)
+                                let saved = self.saveForRetry(
+                                    audio,
+                                    target: target,
+                                    retryRequiresManualInsert: retryMustCopyTranscript
+                                )
                                 self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
                             case .failure(let error):
                                 handlePasteResult(.failure(error))
@@ -1978,10 +2108,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     } else {
                         clearLiveResources()
-                        let saved = self.saveForRetry(audio)
+                        let saved = self.saveForRetry(
+                            audio,
+                            target: target,
+                            retryRequiresManualInsert: retryMustCopyTranscript
+                        )
                         self.finish(status: self.failureStatus("No speech detected", saved: saved), notify: true)
                     }
                 case .success(let transcript):
+                    if let pendingURL {
+                        do {
+                            // Record retry intent before exposing the result or
+                            // sending Command+V. This avoids a second paste if
+                            // the app exits or cannot delete the retained WAV.
+                            try markFailedRecordingForManualInsert(at: pendingURL)
+                            self.pendingRetryRequiresManualInsert = true
+                        } catch {
+                            clearLiveResources()
+                            self.logger.error("Could not prepare saved retry for safe insertion: \(error.localizedDescription)")
+                            self.finish(
+                                status: "Could not prepare saved retry for safe insertion; recording retained",
+                                notify: true
+                            )
+                            return
+                        }
+                    }
+                    if let pendingURL, retryRequiresManualInsert {
+                        do {
+                            try copyTextToClipboard(transcript)
+                            clearLiveResources()
+                            let removed = self.removeSavedRecording(at: pendingURL)
+                            let status = removed
+                                ? "Retry transcript copied to clipboard; replace partial live text manually"
+                                : "Retry transcript copied to clipboard; saved recording retained"
+                            self.finish(status: status, notify: true)
+                        } catch {
+                            handlePasteResult(.failure(error))
+                        }
+                        return
+                    }
                     let finishTranscript: (Bool) -> Void = { inserted in
                         if inserted {
                             handlePasteResult(.success(()))
@@ -2005,7 +2170,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.logger.error("Transcription failed: \(error.localizedDescription)")
                     liveTextInserter?.abort()
                     clearLiveResources()
-                    let saved = self.saveForRetry(audio)
+                    let saved = self.saveForRetry(
+                        audio,
+                        target: target,
+                        retryRequiresManualInsert: retryMustCopyTranscript
+                    )
                     self.finish(status: self.failureStatus(error.localizedDescription, saved: saved), notify: true)
                 }
             }
@@ -2017,9 +2186,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func saveForRetry(_ audio: Data) -> Bool {
+    private func saveForRetry(
+        _ audio: Data,
+        target: NSRunningApplication?,
+        retryRequiresManualInsert: Bool = false
+    ) -> Bool {
         do {
-            pendingRecordingURL = try saveFailedRecording(audio)
+            pendingRecordingURL = try saveFailedRecording(
+                audio,
+                retryRequiresManualInsert: retryRequiresManualInsert
+            )
+            pendingTargetApplication = target
+            pendingRetryRequiresManualInsert = retryRequiresManualInsert
             return true
         } catch {
             logger.error("Could not save failed recording: \(error.localizedDescription)")
@@ -2032,6 +2210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try deleteFailedRecording(at: url)
             if pendingRecordingURL?.path == url.path {
                 pendingRecordingURL = nil
+                pendingTargetApplication = nil
+                pendingRetryRequiresManualInsert = false
             }
             return true
         } catch {
@@ -2057,14 +2237,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func retryFailedRecording() {
         guard state == .idle, let url = pendingRecordingURL else { return }
-        guard requireAccessibilityPermission() else { return }
+        let target = pendingTargetApplication
+        let targetUnavailable = target?.isTerminated ?? true
+        let retryRequiresManualInsert = pendingRetryRequiresManualInsert || targetUnavailable
+        guard retryRequiresManualInsert || requireAccessibilityPermission() else { return }
         guard FileManager.default.fileExists(atPath: url.path) else {
             pendingRecordingURL = nil
+            pendingTargetApplication = nil
+            pendingRetryRequiresManualInsert = false
             finish(status: "Saved recording is unavailable", notify: true)
             return
         }
 
-        let target = currentTargetApplication()
         state = .transcribing
         status = "Retrying saved recording…"
         updateStatusItem()
@@ -2073,7 +2257,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             do {
                 let audio = try Data(contentsOf: url)
                 DispatchQueue.main.async {
-                    self?.transcribeAndPaste(audio: audio, target: target, pendingURL: url)
+                    self?.transcribeAndPaste(
+                        audio: audio,
+                        target: target,
+                        pendingURL: url,
+                        retryRequiresManualInsert: retryRequiresManualInsert
+                    )
                 }
             } catch {
                 DispatchQueue.main.async {

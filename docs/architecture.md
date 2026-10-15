@@ -5,7 +5,7 @@ GPT Transcribe has one platform-neutral transcription flow and two native deskto
 ## Runtime flow
 
 ```text
-Focused text box
+Active target app/window
        │
        │ global hotkey
        ▼
@@ -61,11 +61,13 @@ Optional `prompt`, `keywords[]`, and `languages[]` context settings are included
 
 With `live-transcribe` mode selected, each client opens `wss://api.openai.com/v1/realtime?intent=transcription`, then sends a transcription `session.update` selecting `gpt-live-transcribe`. It streams mono PCM16 audio at 24 kHz through `input_audio_buffer.append`, sends `input_audio_buffer.commit` when the hotkey stops recording, and collects the documented delta and completed events. Each delta is pasted into the target captured when recording began; the final completed transcript is used only to append a missing suffix, so the final result is not pasted twice. If the final transcript revises already-pasted text, the app reports the reconciliation failure and preserves the WAV for retry instead of silently claiming success with incorrect text. The same prompt, keywords, and language context settings are included in the realtime session update.
 
-If transcription or paste fails, the latest WAV is atomically retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
+If transcription or paste fails, the latest WAV is retained at `%APPDATA%\GPTTranscribe\failed-recording.wav` on Windows or `~/Library/Application Support/GPT Transcribe/failed-recording.wav` on macOS. A companion JSON file stores the WAV's SHA-256 digest and whether a retry must copy the result instead of pasting it. Missing or mismatched metadata defaults to copy-only retry. The tray/menu-bar menu can retry that file without recording again; a successful retry removes it, and the user can delete it directly from the same menu.
 
 ### Target capture and paste
 
-At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. Before recording on macOS, the app preflights the post-event permission required for paste and opens the current Privacy & Security destination when access is missing, avoiding an unnecessary transcription request. That destination is labeled **Accessibility** through macOS 26 and **Device Control and Data Access** on macOS 27 and newer. Standard mode restores the target, writes the complete transcript to its native clipboard, and sends one synthetic paste shortcut. Live mode repeats that clipboard/paste operation for each ordered delta and restores the user's prior clipboard after the stream settles. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after post-event permission is granted.
+At recording start, Windows captures the current foreground window handle and macOS captures the current `NSRunningApplication`. These are app/window targets, not specific text controls: each paste goes to whichever field is focused in that target at paste time. Before recording on macOS, the app preflights the post-event permission required for paste and opens the current Privacy & Security destination when access is missing, avoiding an unnecessary transcription request. That destination is labeled **Accessibility** through macOS 26 and **Device Control and Data Access** on macOS 27 and newer. Standard mode activates the captured target, verifies it is foreground, writes the complete transcript to its native clipboard, and sends one synthetic paste shortcut. Live mode repeats that clipboard/paste operation for each ordered delta and restores the user's prior clipboard after the stream settles. Windows posts `Ctrl+V` through Win32 keyboard injection; macOS posts `Command+V` through `CGEvent` after post-event permission is granted. If the target window/app is unavailable or cannot be activated, the paste is stopped.
+
+When live insertion may have left partial text in the target, retry transcribes the retained WAV and copies the complete result to the clipboard for manual replacement. Older WAVs with no metadata and retries after the app restarts also use copy-only mode because the original target identity is no longer available. For ordinary retries that can paste, the app atomically records copy-only intent before exposing the result or sending the paste shortcut; this prevents a second paste if the app exits or cannot delete the retained WAV after insertion.
 
 The previous text clipboard value is retained in memory and restored one second later only if the clipboard still contains the inserted transcript. This avoids overwriting a new copy action made by the user.
 

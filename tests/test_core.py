@@ -267,6 +267,13 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"first")
             core.save_failed_recording(b"latest")
             self.assertEqual(path.read_bytes(), b"latest")
+            self.assertFalse(core.load_retry_requires_manual_insert(path))
+
+    def test_failed_recording_metadata_mismatch_requires_manual_insert(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
+            path = core.save_failed_recording(b"recorded audio")
+            path.write_bytes(b"changed audio")
+            self.assertTrue(core.load_retry_requires_manual_insert(path))
 
     def test_transcription_failure_keeps_audio_for_retry(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
@@ -282,11 +289,43 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
             path = core.save_failed_recording(b"RIFF failed audio")
             app = App()
-            with patch.object(core, "transcribe_audio", return_value="hello"), patch.object(core, "paste_text"):
+            events = []
+            mark_manual = core.mark_failed_recording_for_manual_insert
+
+            def mark_before_paste(saved_path):
+                events.append("mark")
+                mark_manual(saved_path)
+
+            def paste_after_mark(*_args):
+                events.append("paste")
+                self.assertEqual(events, ["mark", "paste"])
+
+            with patch.object(core, "transcribe_audio", return_value="hello"), patch.object(
+                core, "mark_failed_recording_for_manual_insert", side_effect=mark_before_paste
+            ), patch.object(core, "paste_text", side_effect=paste_after_mark):
                 app._transcribe_and_paste(path.read_bytes(), None, pending_path=path)
             self.assertFalse(path.exists())
             self.assertIsNone(app.pending_audio_path)
             self.assertEqual(app.status, "Inserted transcript")
+
+    def test_live_failure_retry_copies_transcript_instead_of_pasting(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"APPDATA": directory}):
+            audio = b"RIFF failed live audio"
+            path = core.save_failed_recording(audio, retry_requires_manual_insert=True)
+            app = App()
+            with patch.object(core, "transcribe_audio", return_value="complete transcript"), patch.object(
+                core, "set_clipboard_text"
+            ) as copy_text, patch.object(core, "paste_text") as paste:
+                app._transcribe_and_paste(
+                    audio,
+                    None,
+                    pending_path=path,
+                    retry_requires_manual_insert=True,
+                )
+            copy_text.assert_called_once_with("complete transcript")
+            paste.assert_not_called()
+            self.assertFalse(path.exists())
+            self.assertIn("copied to clipboard", app.status)
 
     def test_optional_runtime_modules_are_loaded_lazily(self):
         self.assertIsNone(core.sd)

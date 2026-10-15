@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 from array import array
 from collections.abc import Callable
+import hashlib
 from importlib import util as importlib_util
 import json
 import logging
@@ -32,7 +33,7 @@ _TRAY_IMPORT_ERROR: ImportError | None = None
 
 
 APP_NAME = "GPT Transcribe"
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 FILE_TRANSCRIPTION_MODEL = "gpt-transcribe"
 REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 # Keep MODEL as the file-transcription default for callers that imported the
@@ -52,6 +53,7 @@ MAX_TRANSCRIPTION_PROMPT_CHARACTERS = 4_000
 MIN_MAX_RECORDING_SECONDS = 5
 MAX_MAX_RECORDING_SECONDS = 180
 FAILED_RECORDING_FILENAME = "failed-recording.wav"
+FAILED_RECORDING_METADATA_FILENAME = "failed-recording.json"
 STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "GPTTranscribe"
 
@@ -83,6 +85,8 @@ USER32.UnregisterHotKey.argtypes = [wintypes.HWND, wintypes.INT]
 USER32.UnregisterHotKey.restype = wintypes.BOOL
 USER32.GetForegroundWindow.argtypes = []
 USER32.GetForegroundWindow.restype = wintypes.HWND
+USER32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+USER32.GetWindowThreadProcessId.restype = wintypes.DWORD
 USER32.IsWindow.argtypes = [wintypes.HWND]
 USER32.IsWindow.restype = wintypes.BOOL
 USER32.IsIconic.argtypes = [wintypes.HWND]
@@ -194,13 +198,63 @@ def failed_recording_path() -> Path:
     return app_data_dir() / FAILED_RECORDING_FILENAME
 
 
-def save_failed_recording(audio_bytes: bytes) -> Path:
+def failed_recording_metadata_path(path: Path | None = None) -> Path:
+    return (path or failed_recording_path()).with_suffix(".json")
+
+
+def _write_failed_recording_metadata(path: Path, audio_sha256: str, retry_requires_manual_insert: bool) -> None:
+    metadata_path = failed_recording_metadata_path(path)
+    metadata_temporary = metadata_path.with_name(metadata_path.name + ".tmp")
+    metadata = {
+        "audio_sha256": audio_sha256,
+        "retry_requires_manual_insert": bool(retry_requires_manual_insert),
+    }
+    try:
+        with metadata_temporary.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle)
+        metadata_temporary.replace(metadata_path)
+    except Exception:
+        try:
+            metadata_temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def mark_failed_recording_for_manual_insert(path: Path) -> None:
+    audio_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    _write_failed_recording_metadata(path, audio_sha256, True)
+
+
+def load_retry_requires_manual_insert(path: Path | None = None) -> bool:
+    recording = path or failed_recording_path()
+    try:
+        metadata = json.loads(failed_recording_metadata_path(recording).read_text(encoding="utf-8"))
+        audio_hash = hashlib.sha256(recording.read_bytes()).hexdigest()
+        if metadata.get("audio_sha256") != audio_hash:
+            return True
+        return bool(metadata.get("retry_requires_manual_insert", True))
+    except (OSError, ValueError, TypeError, AttributeError):
+        # A legacy or incomplete metadata record may have followed a live
+        # failure with partial text already pasted. Never risk duplicating it.
+        return True
+
+
+def save_failed_recording(audio_bytes: bytes, *, retry_requires_manual_insert: bool = False) -> Path:
     path = failed_recording_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     try:
         with temporary.open("wb") as handle:
             handle.write(audio_bytes)
+        # Commit the matching metadata first. If the process stops before the
+        # WAV replacement, its hash will mismatch and the next launch will use
+        # clipboard-only retry as the safe fallback.
+        _write_failed_recording_metadata(
+            path,
+            hashlib.sha256(audio_bytes).hexdigest(),
+            retry_requires_manual_insert,
+        )
         temporary.replace(path)
     except Exception:
         try:
@@ -215,6 +269,10 @@ def delete_failed_recording(path: Path | None = None) -> None:
     target = path or failed_recording_path()
     try:
         target.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        failed_recording_metadata_path(target).unlink()
     except FileNotFoundError:
         pass
 
@@ -994,13 +1052,18 @@ def _restore_clipboard_if_unchanged(previous: str | None, inserted: str) -> None
 
 
 def _send_paste_shortcut(target_window: int | None) -> None:
-    if target_window and USER32.IsWindow(target_window):
-        if USER32.IsIconic(target_window):
-            USER32.ShowWindow(target_window, SW_RESTORE)
-        if USER32.GetForegroundWindow() != target_window:
-            USER32.SetForegroundWindow(target_window)
-            USER32.BringWindowToTop(target_window)
-            time.sleep(0.12)
+    if not target_window or not USER32.IsWindow(target_window):
+        raise RuntimeError("The original target window is unavailable; transcript was not pasted.")
+    if USER32.IsIconic(target_window):
+        USER32.ShowWindow(target_window, SW_RESTORE)
+    if USER32.GetForegroundWindow() != target_window:
+        USER32.SetForegroundWindow(target_window)
+        USER32.BringWindowToTop(target_window)
+        deadline = time.monotonic() + 0.5
+        while USER32.GetForegroundWindow() != target_window and time.monotonic() < deadline:
+            time.sleep(0.025)
+    if USER32.GetForegroundWindow() != target_window:
+        raise RuntimeError("Could not activate the original target window; transcript was not pasted.")
     USER32.keybd_event(VK_CONTROL, 0, 0, 0)
     USER32.keybd_event(VK_V, 0, 0, 0)
     USER32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
@@ -1014,6 +1077,17 @@ def paste_text(text: str, target_window: int | None) -> None:
     restore_timer = threading.Timer(1.0, _restore_clipboard_if_unchanged, args=(previous, text))
     restore_timer.daemon = True
     restore_timer.start()
+
+
+def current_target_window() -> int | None:
+    window = int(USER32.GetForegroundWindow() or 0)
+    if not window or not USER32.IsWindow(window):
+        return None
+    process_id = wintypes.DWORD()
+    USER32.GetWindowThreadProcessId(window, ctypes.byref(process_id))
+    if process_id.value == os.getpid():
+        return None
+    return window
 
 
 class LiveTextInserter:
@@ -1037,6 +1111,11 @@ class LiveTextInserter:
         time.sleep(0.05)
         self._inserted_text += text
         self._last_clipboard_text = text
+
+    @property
+    def has_inserted_text(self) -> bool:
+        with self._lock:
+            return bool(self._inserted_text)
 
     def append(self, text: str) -> None:
         if not text:
@@ -1148,6 +1227,11 @@ class App:
         saved_recording = failed_recording_path()
         self.pending_audio_path: Path | None = saved_recording if saved_recording.is_file() else None
         self.pending_target_window: int | None = None
+        self.pending_retry_requires_manual_insert = (
+            (load_retry_requires_manual_insert(saved_recording) or self.pending_target_window is None)
+            if self.pending_audio_path
+            else False
+        )
 
     def run(self) -> None:
         tray = _load_tray_dependencies()
@@ -1272,13 +1356,17 @@ class App:
                 notify=True,
             )
             return
+        target_window = current_target_window()
+        if target_window is None:
+            self._set_status("Select a target app before recording", notify=True)
+            return
         with self.state_lock:
             if self.state != "idle":
                 return
             self.state = "starting"
             self.audio_buffer = bytearray()
             self.audio_status_logged = False
-            self.target_window = int(USER32.GetForegroundWindow() or 0) or None
+            self.target_window = target_window
             self.audio_sample_rate = self.config.sample_rate
             self.recording_config = Config(self.config.__dict__)
         try:
@@ -1468,15 +1556,24 @@ class App:
             config,
         )
 
-    def _save_for_retry(self, audio_bytes: bytes, target_window: int | None) -> bool:
+    def _save_for_retry(
+        self,
+        audio_bytes: bytes,
+        target_window: int | None,
+        retry_requires_manual_insert: bool = False,
+    ) -> bool:
         try:
-            path = save_failed_recording(audio_bytes)
+            path = save_failed_recording(
+                audio_bytes,
+                retry_requires_manual_insert=retry_requires_manual_insert,
+            )
         except Exception as exc:
             log_exception("Could not save failed recording", exc)
             return False
         with self.state_lock:
             self.pending_audio_path = path
             self.pending_target_window = target_window
+            self.pending_retry_requires_manual_insert = retry_requires_manual_insert
             if self.icon:
                 self.icon.update_menu()
         return True
@@ -1491,6 +1588,7 @@ class App:
             if self.pending_audio_path == path:
                 self.pending_audio_path = None
                 self.pending_target_window = None
+                self.pending_retry_requires_manual_insert = False
         return True
 
     @staticmethod
@@ -1508,6 +1606,7 @@ class App:
         realtime_session: RealtimeTranscriptionSession | None = None,
         live_text_inserter: LiveTextInserter | None = None,
         config: Config | None = None,
+        retry_requires_manual_insert: bool = False,
     ) -> None:
         try:
             transcript = (
@@ -1517,10 +1616,52 @@ class App:
             )
             inserted = live_text_inserter.complete(transcript) if live_text_inserter is not None else False
             if not transcript and not inserted:
-                saved = self._save_for_retry(audio_bytes, target_window)
+                manual_insert = retry_requires_manual_insert or bool(
+                    live_text_inserter and live_text_inserter.has_inserted_text
+                )
+                saved = self._save_for_retry(audio_bytes, target_window, manual_insert)
                 self._finish_with_status(self._failure_status("No speech detected", saved), notify=True)
                 return
+            if retry_requires_manual_insert:
+                if pending_path is not None:
+                    try:
+                        mark_failed_recording_for_manual_insert(pending_path)
+                    except Exception as exc:
+                        log_exception("Could not prepare saved retry for safe clipboard recovery", exc)
+                        self._finish_with_status(
+                            "Could not prepare saved retry for safe recovery; recording retained",
+                            notify=True,
+                        )
+                        return
+                    with self.state_lock:
+                        self.pending_retry_requires_manual_insert = True
+                set_clipboard_text(transcript)
+                removed = pending_path is None or self._remove_saved_recording(pending_path)
+                message = "Retry transcript copied to clipboard; replace any partial live text manually"
+                if not removed:
+                    message += "; saved recording retained"
+                self._finish_with_status(message, notify=True)
+                return
             if not inserted:
+                if pending_path is not None:
+                    try:
+                        # Persist the retry intent before sending Ctrl+V. If
+                        # insertion succeeds but deleting the WAV fails (or
+                        # the app exits between those steps), another retry
+                        # must not paste the same transcript again.
+                        mark_failed_recording_for_manual_insert(pending_path)
+                    except Exception as exc:
+                        log_exception("Could not prepare saved retry for safe insertion", exc)
+                        self._finish_with_status(
+                            "Could not prepare saved retry for safe insertion; recording retained",
+                            notify=True,
+                        )
+                        return
+                    retry_requires_manual_insert = True
+                    with self.state_lock:
+                        self.pending_retry_requires_manual_insert = True
+                        if self.icon:
+                            self.icon.update_menu()
                 paste_text(transcript, target_window)
             removed = pending_path is None or self._remove_saved_recording(pending_path)
             self._finish_with_status(
@@ -1531,16 +1672,27 @@ class App:
             log_exception("Transcription failed", exc)
             if live_text_inserter is not None:
                 live_text_inserter.abort()
-            saved = self._save_for_retry(audio_bytes, target_window)
+            manual_insert = retry_requires_manual_insert or bool(
+                live_text_inserter and live_text_inserter.has_inserted_text
+            )
+            saved = self._save_for_retry(audio_bytes, target_window, manual_insert)
             self._finish_with_status(self._failure_status(str(exc), saved), notify=True)
         except Exception as exc:
             log_exception("Could not insert transcript", exc)
             if live_text_inserter is not None:
                 live_text_inserter.abort()
-            saved = self._save_for_retry(audio_bytes, target_window)
-            self._finish_with_status(self._failure_status("Could not insert transcript", saved), notify=True)
+            manual_insert = retry_requires_manual_insert or bool(
+                live_text_inserter and live_text_inserter.has_inserted_text
+            )
+            saved = self._save_for_retry(audio_bytes, target_window, manual_insert)
+            self._finish_with_status(self._failure_status(str(exc) or "Could not insert transcript", saved), notify=True)
 
-    def _retry_failed_recording(self, path: Path, target_window: int | None) -> None:
+    def _retry_failed_recording(
+        self,
+        path: Path,
+        target_window: int | None,
+        retry_requires_manual_insert: bool,
+    ) -> None:
         try:
             audio_bytes = path.read_bytes()
         except Exception as exc:
@@ -1550,7 +1702,12 @@ class App:
         if len(audio_bytes) < 1_000:
             self._finish_with_status("Saved recording is empty", notify=True)
             return
-        self._transcribe_and_paste(audio_bytes, target_window, pending_path=path)
+        self._transcribe_and_paste(
+            audio_bytes,
+            target_window,
+            pending_path=path,
+            retry_requires_manual_insert=retry_requires_manual_insert or target_window is None,
+        )
 
     def _finish_with_status(self, status: str, notify: bool) -> None:
         with self.state_lock:
@@ -1613,7 +1770,12 @@ class App:
         self._set_status(f"Mode set to {mode}", notify=True)
 
     def _menu_retry_label(self, _item) -> str:
-        return "Retry failed recording"
+        with self.state_lock:
+            target_unavailable = (
+                self.pending_target_window is None or not USER32.IsWindow(self.pending_target_window)
+            )
+            suffix = " (copy transcript)" if self.pending_retry_requires_manual_insert or target_unavailable else ""
+            return f"Retry failed recording{suffix}"
 
     def _can_retry(self, _item) -> bool:
         with self.state_lock:
@@ -1628,6 +1790,7 @@ class App:
 
     def _menu_retry(self, _icon, _item) -> None:
         missing = False
+        retry_requires_manual_insert = False
         with self.state_lock:
             if self.state != "idle":
                 return
@@ -1637,10 +1800,13 @@ class App:
                 path = None
                 self.pending_audio_path = None
                 self.pending_target_window = None
+                self.pending_retry_requires_manual_insert = False
             else:
+                retry_requires_manual_insert = self.pending_retry_requires_manual_insert
                 target_window = self.pending_target_window
                 if target_window is None or not USER32.IsWindow(target_window):
-                    target_window = int(USER32.GetForegroundWindow() or 0) or None
+                    target_window = None
+                    retry_requires_manual_insert = True
                 self.state = "transcribing"
                 self.status = "Retrying saved recording…"
                 if self.icon:
@@ -1653,7 +1819,7 @@ class App:
             return
         worker = threading.Thread(
             target=self._retry_failed_recording,
-            args=(path, target_window),
+            args=(path, target_window, retry_requires_manual_insert),
             name="GPTTranscribeRetry",
             daemon=True,
         )
@@ -1711,7 +1877,7 @@ class App:
             realtime_transcription = tk.BooleanVar(value=self.config.realtime_transcription)
             ttk.Checkbutton(
                 frame,
-                text="Use live-transcribe (stream into focused text box)",
+                text="Use live-transcribe (stream into active app)",
                 variable=realtime_transcription,
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
 
