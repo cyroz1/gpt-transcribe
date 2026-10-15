@@ -65,6 +65,13 @@ final class GPTTranscribeMacTests: XCTestCase {
         XCTAssertFalse(AppConfig(realtimeTranscription: false).realtimeTranscription)
     }
 
+    func testLiveWordBoundarySpacing() {
+        XCTAssertTrue(needsLiveWordSeparator(previous: "I've been", next: "fucked up"))
+        XCTAssertFalse(needsLiveWordSeparator(previous: "I've been ", next: "fucked up"))
+        XCTAssertFalse(needsLiveWordSeparator(previous: "3.", next: "14"))
+        XCTAssertFalse(needsLiveWordSeparator(previous: "hello", next: ", world"))
+    }
+
     func testRealtimeConnectionUsesTheTranscriptionSessionRoute() {
         XCTAssertEqual(realtimeURL.absoluteString, "wss://api.openai.com/v1/realtime?intent=transcription")
         XCTAssertFalse(realtimeURL.absoluteString.contains("model="))

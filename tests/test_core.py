@@ -225,6 +225,41 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(send_paste.call_count, 2)
         timer.assert_called_once()
 
+    def test_live_text_inserter_separates_adjacent_word_chunks(self):
+        with patch.object(core, "read_clipboard_text", return_value="previous"), patch.object(
+            core, "set_clipboard_text"
+        ) as set_clipboard, patch.object(core, "_send_paste_shortcut"), patch.object(
+            core.threading, "Timer"
+        ):
+            inserter = core.LiveTextInserter(None)
+            inserter.append("I've been")
+            inserter.append("fucked up")
+            self.assertTrue(inserter.complete("I've been fucked up"))
+
+        self.assertEqual(set_clipboard.call_args_list, [call("I've been"), call(" fucked up")])
+
+    def test_live_text_inserter_does_not_change_numeric_punctuation_boundaries(self):
+        with patch.object(core, "read_clipboard_text", return_value=None), patch.object(
+            core, "set_clipboard_text"
+        ) as set_clipboard, patch.object(core, "_send_paste_shortcut"):
+            inserter = core.LiveTextInserter(None)
+            inserter.append("3.")
+            inserter.append("14,2")
+            self.assertTrue(inserter.complete("3.14,2"))
+
+        self.assertEqual(set_clipboard.call_args_list, [call("3."), call("14,2")])
+
+    def test_standard_paste_preserves_full_transcript_spacing(self):
+        transcript = "I've been fucked up for a while now."
+        with patch.object(core, "read_clipboard_text", return_value=None), patch.object(
+            core, "set_clipboard_text"
+        ) as set_clipboard, patch.object(core, "_send_paste_shortcut"), patch.object(
+            core.threading, "Timer"
+        ):
+            core.paste_text(transcript, None)
+
+        set_clipboard.assert_called_once_with(transcript)
+
     def test_live_text_inserter_rejects_final_revision(self):
         with patch.object(core, "read_clipboard_text", return_value="previous"), patch.object(
             core, "set_clipboard_text"
