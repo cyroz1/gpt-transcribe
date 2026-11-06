@@ -328,11 +328,20 @@ enum KeychainStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        let attributes: [String: Any] = [kSecValueData as String: data]
+        // Bind the item to this device and to the unlocked state instead of
+        // leaving its protection to the platform default. The accessibility
+        // attribute is set in the update attributes as well, so an item
+        // stored by an older build gains the binding on its next save
+        // without the user re-entering the key.
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecItemNotFound {
             var addQuery = query
             addQuery[kSecValueData as String] = data
+            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else { throw KeychainError(status: addStatus) }
         } else if updateStatus != errSecSuccess {
@@ -1167,7 +1176,47 @@ enum LaunchAtLogin {
     }
 }
 
+/// Neutralize control characters in server-produced transcript text before
+/// it reaches the pasteboard/paste sink. An embedded newline could act as
+/// an Enter keypress in the receiving application, so line breaks and tabs
+/// collapse to a single space and every other C0 control (including ESC)
+/// and DEL are removed. Ordinary text and spacing are preserved.
+func sanitizeTranscriptText(_ text: String) -> String {
+    var result = ""
+    result.reserveCapacity(text.count)
+    var previousWasLineBreak = false
+    for scalar in text.unicodeScalars {
+        switch scalar.value {
+        case 0x0A, 0x0D, 0x09:
+            if !previousWasLineBreak {
+                result.append(" ")
+            }
+            previousWasLineBreak = true
+        case 0x00...0x1F, 0x7F:
+            continue
+        default:
+            previousWasLineBreak = false
+            result.unicodeScalars.append(scalar)
+        }
+    }
+    return result
+}
+
+/// Best-effort restore of the prior pasteboard text after a failed paste.
+/// Restores only when the pasteboard still holds the text this app wrote
+/// (or is empty because the write itself failed), so newer content from
+/// another application is never clobbered.
+func restoreClipboardAfterFailedPaste(previous: String?, writtenText: String) {
+    guard let previous else { return }
+    let pasteboard = NSPasteboard.general
+    let current = pasteboard.string(forType: .string)
+    if let current, current != writtenText { return }
+    pasteboard.clearContents()
+    pasteboard.setString(previous, forType: .string)
+}
+
 func pasteText(_ text: String, into application: NSRunningApplication?, completion: @escaping (Result<Void, Error>) -> Void) {
+    let text = sanitizeTranscriptText(text)
     guard let application, !application.isTerminated else {
         completion(.failure(PasteError.targetUnavailable))
         return
@@ -1199,10 +1248,12 @@ func pasteText(_ text: String, into application: NSRunningApplication?, completi
         let previous = pasteboard.string(forType: .string)
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
+            restoreClipboardAfterFailedPaste(previous: previous, writtenText: text)
             completion(.failure(PasteError.couldNotWriteClipboard))
             return
         }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else {
+            restoreClipboardAfterFailedPaste(previous: previous, writtenText: text)
             completion(.failure(PasteError.targetUnavailable))
             return
         }
@@ -1224,7 +1275,7 @@ func pasteText(_ text: String, into application: NSRunningApplication?, completi
 func copyTextToClipboard(_ text: String) throws {
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    guard pasteboard.setString(text, forType: .string) else {
+    guard pasteboard.setString(sanitizeTranscriptText(text), forType: .string) else {
         throw PasteError.couldNotWriteClipboard
     }
 }
@@ -1426,6 +1477,7 @@ final class LiveTextInserter {
 
     private func pasteChunk(_ text: String) throws {
         guard !text.isEmpty else { return }
+        let text = sanitizeTranscriptText(text)
         try runOnMain {
             guard let application = self.application, !application.isTerminated else {
                 return .failure(PasteError.targetUnavailable)
@@ -1456,9 +1508,11 @@ final class LiveTextInserter {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             guard pasteboard.setString(text, forType: .string) else {
+                restoreClipboardAfterFailedPaste(previous: self.previousClipboard, writtenText: text)
                 return .failure(PasteError.couldNotWriteClipboard)
             }
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier else {
+                restoreClipboardAfterFailedPaste(previous: self.previousClipboard, writtenText: text)
                 return .failure(PasteError.targetUnavailable)
             }
             keyDown.flags = .maskCommand
@@ -2250,7 +2304,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard state == .idle, let url = pendingRecordingURL else { return }
         let target = pendingTargetApplication
         let targetUnavailable = target?.isTerminated ?? true
-        let retryRequiresManualInsert = pendingRetryRequiresManualInsert || targetUnavailable
+        // Re-verify the retained bytes against the sidecar instead of
+        // trusting the save-time cache: the WAV could have been replaced
+        // after the failure was saved, and only a fresh hash check binds
+        // the paste decision to the bytes actually read.
+        let retryRequiresManualInsert = pendingRetryRequiresManualInsert
+            || targetUnavailable
+            || failedRecordingRequiresManualInsert(at: url)
+        pendingRetryRequiresManualInsert = retryRequiresManualInsert
         guard retryRequiresManualInsert || requireAccessibilityPermission() else { return }
         guard FileManager.default.fileExists(atPath: url.path) else {
             pendingRecordingURL = nil

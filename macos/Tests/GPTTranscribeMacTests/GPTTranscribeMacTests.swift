@@ -170,4 +170,12 @@ final class GPTTranscribeMacTests: XCTestCase {
         try deleteFailedRecording(at: path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
     }
+
+    func testSanitizeTranscriptTextNeutralizesControlCharacters() {
+        XCTAssertEqual(sanitizeTranscriptText("hello\nworld"), "hello world")
+        XCTAssertEqual(sanitizeTranscriptText("run this\r\nnow"), "run this now")
+        XCTAssertEqual(sanitizeTranscriptText("a\u{1B}[31mb\u{00}c\u{7F}"), "a[31mbc")
+        XCTAssertEqual(sanitizeTranscriptText("keep  spacing\tand text"), "keep  spacing and text")
+        XCTAssertEqual(sanitizeTranscriptText("plain text."), "plain text.")
+    }
 }
