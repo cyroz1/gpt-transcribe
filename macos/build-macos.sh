@@ -19,7 +19,10 @@ chmod 755 "$app_path/Contents/MacOS/GPTTranscribe"
 
 # Prefer a stable local signing identity so macOS Accessibility consent stays
 # attached when the app is rebuilt. CI/release environments can provide
-# CODESIGN_IDENTITY explicitly; otherwise fall back to ad-hoc signing.
+# CODESIGN_IDENTITY explicitly; otherwise fall back to ad-hoc signing for
+# local development builds only. Release builds (GPT_TRANSCRIBE_RELEASE=1,
+# set by the release workflow) fail closed instead of shipping an ad-hoc
+# signed artifact.
 signing_identity="${CODESIGN_IDENTITY:-}"
 if [ -z "$signing_identity" ] && command -v security >/dev/null 2>&1; then
     signing_identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development:/{print $2; exit}')"
@@ -27,7 +30,12 @@ fi
 
 if [ -n "$signing_identity" ]; then
     codesign --force --deep --sign "$signing_identity" "$app_path"
+elif [ "${GPT_TRANSCRIBE_RELEASE:-}" = "1" ]; then
+    echo "error: no code signing identity is configured for this release build." >&2
+    echo "Configure a Developer ID Application identity (for example the CODESIGN_IDENTITY secret) before releasing; refusing to ship an ad-hoc signed release." >&2
+    exit 1
 else
+    echo "warning: no signing identity found; ad-hoc signing this local development build." >&2
     codesign --force --deep --sign - "$app_path"
 fi
 

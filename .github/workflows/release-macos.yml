@@ -5,25 +5,35 @@ on:
     tags:
       - "v*"
 
+# Read-only by default; only the release job gets contents: write, which
+# it needs to publish the GitHub release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
-    runs-on: macos-latest
+    runs-on: macos-15
+    permissions:
+      contents: write
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run native macOS tests
         run: swift test --package-path macos
 
       - name: Build app bundle and DMG
         run: ./macos/build-macos.sh
+        env:
+          # Release builds fail closed in build-macos.sh when no signing
+          # identity is configured, instead of shipping an ad-hoc signed
+          # DMG. Provide a Developer ID identity via this secret to sign.
+          GPT_TRANSCRIBE_RELEASE: "1"
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
 
       - name: Publish macOS release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: GPT Transcribe ${{ github.ref_name }}
           # The Windows release job is the single owner of generated notes.

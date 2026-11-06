@@ -39,7 +39,7 @@ Requirements: macOS 13 or newer, Xcode Command Line Tools, and network access to
 ./macos/build-macos.sh
 ```
 
-The script runs the Swift tests, builds a release binary, creates `dist/GPTTranscribe.app`, signs it with `CODESIGN_IDENTITY` or the first local Apple Development identity when available, and creates `dist/GPTTranscribe.dmg` when `hdiutil` is available. It falls back to ad-hoc signing when no identity is available. The app is intentionally not notarized by this repository; a distribution certificate and Apple notarization credentials belong in the release environment.
+The script runs the Swift tests, builds a release binary, creates `dist/GPTTranscribe.app`, signs it with `CODESIGN_IDENTITY` or the first local Apple Development identity when available, and creates `dist/GPTTranscribe.dmg` when `hdiutil` is available. It falls back to ad-hoc signing when no identity is available. The release workflow sets `GPT_TRANSCRIBE_RELEASE=1`, which turns that fallback into a hard failure so a release is never shipped ad-hoc signed by accident; a release therefore needs a signing identity configured (for example a `CODESIGN_IDENTITY` repository secret). The app is intentionally not notarized by this repository; a distribution certificate and Apple notarization credentials belong in the release environment.
 
 ## Windows
 
