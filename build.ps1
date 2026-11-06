@@ -8,8 +8,14 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     python -m venv $venvPath
 }
 
-& $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install -r (Join-Path $projectRoot 'requirements.txt') pyinstaller
+# Pin pip itself so the tool that installs the hashed requirements below
+# is also bound to a reviewed version. (The self-upgrade is version-pinned
+# only: pip cannot hash-verify its own bootstrap upgrade.)
+& $venvPython -m pip install --upgrade "pip==26.3"
+# requirements.txt pins every runtime and build dependency (including
+# PyInstaller) to an exact version with a SHA-256 hash; pip verifies the
+# hashes automatically because they are present in the file.
+& $venvPython -m pip install -r (Join-Path $projectRoot 'requirements.txt')
 
 & $venvPython -m PyInstaller `
     --noconfirm `

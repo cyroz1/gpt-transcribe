@@ -1,4 +1,50 @@
-Pillow>=10.0
-pystray>=0.19.5
-sounddevice>=0.5.0
-websocket-client>=1.8.0
+# Locked dependency set for the Windows build (build.ps1).
+#
+# Every package is pinned to an exact version with the SHA-256 of the
+# artifact pip resolves for CPython 3.12 on win_amd64 (the release
+# workflow's setup-python version and runner platform). Because hashes are
+# present, pip installs in require-hashes mode: an artifact that does not
+# match a hash below fails the build instead of being bundled into the
+# published installer.
+#
+# Regenerate after changing a version: resolve with
+#   pip download --only-binary=:all: --platform win_amd64 \
+#     --python-version 3.12 --implementation cp --abi cp312
+# for the direct dependencies plus the Windows-only PyInstaller
+# dependencies (pefile, pywin32-ctypes), then record each wheel's sha256.
+
+# Runtime dependencies
+Pillow==13.0.0 \
+    --hash=sha256:ff3fe9eb621fbb9db4c4be33ab946f6bac5f98ab50ca8d3260503653656c961b
+pystray==0.19.5 \
+    --hash=sha256:a0c2229d02cf87207297c22d86ffc57c86c227517b038c0d3c59df79295ac617
+sounddevice==0.5.6 \
+    --hash=sha256:7f4162f514f007b0bf25a3ccfed3f1705bc2ec311888a90232729eec4f57a4f4
+websocket-client==1.9.2 \
+    --hash=sha256:e1a673830a9c7bfa47b1cd3d5e4178f4c9651d80a4eab02c9c23a1c3ec6250ce
+
+# Build dependency (used by build.ps1 only)
+pyinstaller==6.22.3 \
+    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
+
+# Transitive dependencies
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+cffi==2.1.1 \
+    --hash=sha256:f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pefile==2024.8.26 ; sys_platform == "win32" \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+pycparser==3.12 \
+    --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e
+pyinstaller-hooks-contrib==2026.9 \
+    --hash=sha256:fb3e67dd64122561724c48ad0366ac9e8c16e638b63bf7d85de03bf3fdbf06c3
+python-xlib==0.33 ; sys_platform == "linux" \
+    --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+pywin32-ctypes==0.2.3 ; sys_platform == "win32" \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
