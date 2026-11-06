@@ -25,6 +25,7 @@ from gpt_transcribe import (  # noqa: E402
     make_wav,
     parse_max_recording_seconds,
     parse_hotkey,
+    sanitize_transcript_text,
     startup_command,
     validate_transcription_settings,
 )
@@ -259,6 +260,29 @@ class CoreTests(unittest.TestCase):
             core.paste_text(transcript, None)
 
         set_clipboard.assert_called_once_with(transcript)
+
+    def test_sanitize_transcript_text_neutralizes_control_characters(self):
+        self.assertEqual(sanitize_transcript_text("hello\nworld"), "hello world")
+        self.assertEqual(sanitize_transcript_text("run this\r\nnow"), "run this now")
+        self.assertEqual(sanitize_transcript_text("a\x1b[31mb\x00c\x7f"), "a[31mbc")
+        self.assertEqual(sanitize_transcript_text("keep  spacing\tand text"), "keep  spacing and text")
+        self.assertEqual(sanitize_transcript_text("plain text."), "plain text.")
+
+    def test_paste_failure_restores_previous_clipboard(self):
+        writes = []
+
+        def fake_set(value):
+            writes.append(value)
+
+        with patch.object(
+            core, "read_clipboard_text", side_effect=["previous", "transcript"]
+        ), patch.object(core, "set_clipboard_text", side_effect=fake_set), patch.object(
+            core, "_send_paste_shortcut", side_effect=RuntimeError("target gone")
+        ):
+            with self.assertRaises(RuntimeError):
+                core.paste_text("transcript", None)
+
+        self.assertEqual(writes, ["transcript", "previous"])
 
     def test_live_text_inserter_rejects_final_revision(self):
         with patch.object(core, "read_clipboard_text", return_value="previous"), patch.object(

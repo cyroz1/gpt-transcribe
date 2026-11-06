@@ -1014,6 +1014,42 @@ def read_clipboard_text() -> str | None:
         USER32.CloseClipboard()
 
 
+_CONTROL_CHARACTERS_EXCEPT_WHITESPACE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_WHITESPACE_CONTROL_RUN = re.compile(r"[\r\n\t]+")
+
+
+def sanitize_transcript_text(text: str) -> str:
+    """Neutralize control characters in server-produced transcript text.
+
+    Transcripts come from a remote service and are pasted into another
+    application under the user's input authority. An embedded newline could
+    act as an Enter keypress in the receiving application, so line breaks
+    and tabs collapse to a single space and every other C0 control
+    (including ESC) and DEL are removed. Ordinary text and spacing are
+    preserved.
+    """
+    without_controls = _CONTROL_CHARACTERS_EXCEPT_WHITESPACE.sub("", text)
+    return _WHITESPACE_CONTROL_RUN.sub(" ", without_controls)
+
+
+def _restore_clipboard_after_failure(previous: str | None, inserted: str) -> None:
+    """Best-effort restore of the prior clipboard text after a failed paste.
+
+    Restores only when the clipboard still holds the text this app wrote
+    (or is empty because the write itself failed), so newer content from
+    another application is never clobbered.
+    """
+    if previous is None:
+        return
+    try:
+        current = read_clipboard_text()
+        if current is not None and current != inserted:
+            return
+        set_clipboard_text(previous)
+    except Exception as exc:  # pragma: no cover - depends on other apps using clipboard
+        log_exception("Could not restore clipboard", exc)
+
+
 def set_clipboard_text(text: str) -> None:
     if not _open_clipboard():
         raise RuntimeError("Windows clipboard is busy.")
@@ -1071,9 +1107,17 @@ def _send_paste_shortcut(target_window: int | None) -> None:
 
 
 def paste_text(text: str, target_window: int | None) -> None:
+    text = sanitize_transcript_text(text)
     previous = read_clipboard_text()
-    set_clipboard_text(text)
-    _send_paste_shortcut(target_window)
+    try:
+        set_clipboard_text(text)
+        _send_paste_shortcut(target_window)
+    except Exception:
+        # The clipboard was already overwritten at this point. Restore the
+        # prior contents instead of leaving the transcript in the shared
+        # clipboard and destroying what the user had there.
+        _restore_clipboard_after_failure(previous, text)
+        raise
     restore_timer = threading.Timer(1.0, _restore_clipboard_if_unchanged, args=(previous, text))
     restore_timer.daemon = True
     restore_timer.start()
@@ -1124,10 +1168,18 @@ class LiveTextInserter:
     def _append_locked(self, text: str, *, normalize_boundary: bool = False) -> None:
         if not text:
             return
+        text = sanitize_transcript_text(text)
         if normalize_boundary and _needs_live_word_separator(self._inserted_text, text):
             text = " " + text
-        set_clipboard_text(text)
-        _send_paste_shortcut(self.target_window)
+        try:
+            set_clipboard_text(text)
+            _send_paste_shortcut(self.target_window)
+        except Exception:
+            # Restore the pre-session clipboard right away: the scheduled
+            # restore keys off the last successful chunk and would not fire
+            # for this failed one.
+            _restore_clipboard_after_failure(self.previous_clipboard, text)
+            raise
         # Give the target application time to consume this chunk before the
         # clipboard is replaced by the next delta.
         time.sleep(0.05)
@@ -1655,7 +1707,7 @@ class App:
                         return
                     with self.state_lock:
                         self.pending_retry_requires_manual_insert = True
-                set_clipboard_text(transcript)
+                set_clipboard_text(sanitize_transcript_text(transcript))
                 removed = pending_path is None or self._remove_saved_recording(pending_path)
                 message = "Retry transcript copied to clipboard; replace any partial live text manually"
                 if not removed:
@@ -1713,6 +1765,11 @@ class App:
         target_window: int | None,
         retry_requires_manual_insert: bool,
     ) -> None:
+        # Defense in depth alongside _menu_retry: re-check the sidecar hash
+        # at consumption time, not only when the failure was saved.
+        retry_requires_manual_insert = (
+            retry_requires_manual_insert or load_retry_requires_manual_insert(path)
+        )
         try:
             audio_bytes = path.read_bytes()
         except Exception as exc:
@@ -1822,7 +1879,15 @@ class App:
                 self.pending_target_window = None
                 self.pending_retry_requires_manual_insert = False
             else:
-                retry_requires_manual_insert = self.pending_retry_requires_manual_insert
+                # Re-verify the retained bytes against the sidecar instead of
+                # trusting the save-time cache: the WAV could have been
+                # replaced after the failure was saved, and only a fresh hash
+                # check binds the paste decision to the bytes actually read.
+                retry_requires_manual_insert = (
+                    self.pending_retry_requires_manual_insert
+                    or load_retry_requires_manual_insert(path)
+                )
+                self.pending_retry_requires_manual_insert = retry_requires_manual_insert
                 target_window = self.pending_target_window
                 if target_window is None or not USER32.IsWindow(target_window):
                     target_window = None
